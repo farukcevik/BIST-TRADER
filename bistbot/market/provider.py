@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import re
 import time
+import urllib.request
+import ssl
+import certifi
+from concurrent.futures import ThreadPoolExecutor,as_completed
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
+from pathlib import Path
 
 from bistbot.app.models import Candle, MarketDataResult, MarketSnapshot, ProviderDiagnostics
 
@@ -62,6 +68,7 @@ class DemoTransport:
 
 
 class DemoMarketDataProvider:
+    provider_mode = "MOCK"
     SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,11}(?:\.IS)?$")
 
     def __init__(self, transport: MarketDataTransport | None = None, *, timeout_seconds: float = 10,
@@ -170,3 +177,75 @@ def _interval_delta(interval: str) -> timedelta:
     if not match: raise ValueError(f"unsupported interval: {interval}")
     amount, unit = int(match.group(1)), match.group(2)
     return {"m":timedelta(minutes=amount),"h":timedelta(hours=amount),"d":timedelta(days=amount)}[unit]
+
+
+class BistSymbolUniverse:
+    def __init__(self,path: str|Path="data/bist_symbols.txt"): self.path=Path(path); self.invalid_symbols=[]
+    def load(self) -> list[str]:
+        valid=[]; self.invalid_symbols=[]
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            symbol=line.strip().upper()
+            if not symbol or symbol.startswith("#"): continue
+            if not re.fullmatch(r"[A-Z0-9]{3,6}",symbol): self.invalid_symbols.append(symbol); continue
+            ticker=f"{symbol}.IS"
+            if ticker not in valid: valid.append(ticker)
+        return valid
+
+
+class YahooChartTransport:
+    """Read-only Yahoo chart transport. It has no order or broker capability."""
+    def __init__(self,*,workers: int=6,retries: int=2,backoff_seconds: float=.5,
+                 opener=urllib.request.urlopen,sleeper=time.sleep):
+        self.workers,self.retries,self.backoff_seconds=workers,retries,backoff_seconds
+        self.opener,self.sleeper=opener,sleeper
+        self.ssl_context=ssl.create_default_context(cafile=certifi.where())
+
+    def fetch(self,symbols: Sequence[str],*,bars: int,interval: str,timeout_seconds: float):
+        output={}
+        with ThreadPoolExecutor(max_workers=min(self.workers,max(1,len(symbols)))) as pool:
+            futures={pool.submit(self._one,symbol,bars,interval,timeout_seconds):symbol for symbol in symbols}
+            for future in as_completed(futures):
+                try:
+                    candles=future.result()
+                    if candles: output[futures[future]]=candles
+                except Exception: pass
+        return output
+
+    def _one(self,symbol: str,bars: int,interval: str,timeout_seconds: float) -> list[Candle]:
+        range_value="1mo" if interval.endswith(("m","h")) else "6mo"
+        url=f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range={range_value}&interval={interval}"
+        last_error=None
+        for attempt in range(self.retries+1):
+            try:
+                request=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 BISTBOT/1.0"})
+                try: response=self.opener(request,timeout=timeout_seconds,context=self.ssl_context)
+                except TypeError: response=self.opener(request,timeout=timeout_seconds)
+                with response: payload=json.load(response)
+                result=payload["chart"]["result"][0]; timestamps=result.get("timestamp",[])
+                quote=result["indicators"]["quote"][0]; candles=[]
+                for index,timestamp in enumerate(timestamps):
+                    values=[quote.get(key,[None]*len(timestamps))[index] for key in ("open","high","low","close","volume")]
+                    if any(value is None for value in values): continue
+                    opening,high,low,close,volume=values
+                    if min(opening,high,low,close)<=0 or volume<0: continue
+                    candles.append(Candle(symbol=symbol,timestamp=datetime.fromtimestamp(timestamp,timezone.utc),
+                        open=opening,high=high,low=low,close=close,volume=volume))
+                return candles[-bars:]
+            except Exception as error:
+                last_error=error
+                if attempt<self.retries: self.sleeper(self.backoff_seconds*2**attempt)
+        raise last_error or RuntimeError("Yahoo response unavailable")
+
+
+class YahooBistProvider(DemoMarketDataProvider):
+    provider_mode = "REAL"
+    def __init__(self,universe: BistSymbolUniverse|None=None,**kwargs):
+        self.universe=universe or BistSymbolUniverse()
+        super().__init__(YahooChartTransport(),batch_size=kwargs.pop("batch_size",30),
+                         requests_per_second=kwargs.pop("requests_per_second",2),**kwargs)
+
+    def active_symbols(self) -> list[str]: return self.universe.load()
+    @property
+    def invalid_symbols(self) -> list[str]: return list(self.universe.invalid_symbols)
+    def intraday(self,symbols: Sequence[str],*,bars: int=60,interval: str="1h") -> dict[str,MarketDataResult]:
+        return self._fetch(symbols,bars,interval,self.stale_after)

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from bistbot.app.config import IntelligenceSettings
-from bistbot.app.models import EventItem, EventSourceType, RankedEventCandidate, TechnicalSignal
+from bistbot.app.models import EventItem, EventSourceType,IntelligenceStatus, RankedEventCandidate, TechnicalSignal
 from bistbot.intelligence.kap_provider import KapProvider
 from bistbot.intelligence.news_provider import NewsProvider
 from bistbot.storage.repositories import EventRepository, IntelligenceRankingRepository
@@ -62,7 +62,7 @@ class EventRanker:
         for candidate in candidates:
             symbol_events = by_symbol[candidate.symbol]
             scores = [self._score_event(event, candidate.symbol, now) for event in symbol_events]
-            event_score = max(scores) if scores else 0.0
+            event_score = max(scores) if scores else 50.0
             if len(scores) > 1: event_score = min(100.0, event_score*.8 + sum(scores)/len(scores)*.2)
             combined = (candidate.overall_scanner_score if not any_events else
                         candidate.overall_scanner_score*self.settings.scanner_weight + event_score*self.settings.event_weight)
@@ -70,7 +70,8 @@ class EventRanker:
             if symbol_events: reasons.append(f"{len(symbol_events)} unique event(s)")
             ranked.append(RankedEventCandidate(symbol=candidate.symbol, scanner_score=candidate.overall_scanner_score,
                 event_score=round(event_score,4), combined_score=round(combined,4),
-                event_ids=[event.id for event in sorted(symbol_events,key=lambda item:item.published_at,reverse=True)], reasons=reasons))
+                event_ids=[event.id for event in sorted(symbol_events,key=lambda item:item.published_at,reverse=True)], reasons=reasons,
+                intelligence_status=IntelligenceStatus.EVENTS_AVAILABLE if symbol_events else IntelligenceStatus.NO_NEWS))
         ranked.sort(key=lambda item:(-item.combined_score,item.symbol)); selected = ranked[:limit]
         if self.ranking_repository:
             cycle_id = uuid4().hex

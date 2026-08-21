@@ -54,13 +54,18 @@ class DeterministicMarketScanner:
         prior_high = max(highs[-lookback-1:-1]) if len(highs) > lookback else max(highs[:-1])
         recent_high_distance = return_pct(close, prior_high)
         breakout = close > prior_high
-        rv_period = min(self.settings.relative_volume_lookback, len(volumes)-1)
-        average_volume = sum(volumes[-rv_period-1:-1]) / rv_period
-        relative_volume = volumes[-1] / average_volume if average_volume > 0 else 0
-        average_turnover = sum(c*v for c, v in zip(closes[-rv_period-1:-1], volumes[-rv_period-1:-1])) / rv_period
+        completed=[index for index,volume in enumerate(volumes) if volume>0]
+        if len(completed)<2: raise InvalidMarketData("insufficient completed volume bars")
+        volume_index=completed[-1]; history_indices=completed[:-1][-self.settings.relative_volume_lookback:]
+        rv_period=len(history_indices); latest_volume=volumes[volume_index]
+        average_volume=sum(volumes[index] for index in history_indices)/rv_period
+        relative_volume=latest_volume/average_volume if average_volume>0 else 0
+        average_turnover=sum(closes[index]*volumes[index] for index in history_indices)/rv_period
         volatility = volatility_pct(closes, 14); atr_pct = atr_14 / close * 100
-        liquidity_score = _clamp(min(average_volume/self.settings.minimum_average_volume,
-                                     average_turnover/self.settings.minimum_average_turnover_try) * 70)
+        continuity=sum(volumes[index]>0 for index in range(max(0,volume_index-rv_period+1),volume_index+1))/rv_period
+        volume_liquidity=_clamp(50+20*math.log10(max(average_volume/self.settings.minimum_average_volume,.01)))
+        turnover_liquidity=_clamp(50+20*math.log10(max(average_turnover/self.settings.minimum_average_turnover_try,.01)))
+        liquidity_score=_clamp(volume_liquidity*.40+turnover_liquidity*.45+continuity*100*.15)
         if average_volume < self.settings.minimum_average_volume or average_turnover < self.settings.minimum_average_turnover_try:
             return None
         momentum_score = _clamp(50 + one_bar*3 + momentum_3*2 + momentum_12)
@@ -92,6 +97,7 @@ class DeterministicMarketScanner:
             "momentum_12":momentum_12,"relative_volume":relative_volume,"ema_9":ema_9,"ema_21":ema_21,
             "rsi_14":rsi_14,"atr_14":atr_14,"atr_pct":atr_pct,"recent_high_distance":recent_high_distance,
             "breakout":breakout,"average_volume":average_volume,"average_turnover_try":average_turnover,
+            "latest_price":close,"latest_volume":latest_volume,"trading_continuity":continuity,
             "volatility_pct":volatility}, reasons=reasons)
 
     def _validate(self, symbol: str, bars: Sequence[MarketBar], now: datetime) -> None:

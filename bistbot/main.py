@@ -34,12 +34,18 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
               f"technical_score={item['technical_score']:.2f} momentum_score={item['momentum_score']:.2f} "
               f"volume_score={item['volume_score']:.2f} trend_score={item['trend_score']:.2f} "
               f"liquidity_score={item['liquidity_score']:.2f}")
+        print(f"    latest_price={item['latest_price']} latest_timestamp={item['latest_timestamp']} "
+              f"average_volume={item['average_volume']} latest_volume={item['latest_volume']} "
+              f"relative_volume={item['relative_volume']} EMA9={item['ema9']} EMA21={item['ema21']} "
+              f"RSI14={item['rsi14']} ATR14={item['atr14']} average_turnover_try={item['average_turnover_try']} "
+              f"trading_continuity={item['trading_continuity']}")
     print("\nTOP 10 INTELLIGENCE / LLM CANDIDATES")
     for item in diagnostics.get("candidates",[]):
         print(f"\n{item['symbol']}")
         for key in ("scanner_score","news_kap_score","sentiment","importance","catalyst_score",
                     "priced_in_probability","risk_score","confidence","action_bias","final_score","decision","reason"):
             print(f"{key}: {item[key]}")
+        print(f"news_status: {item['news_status']}\nllm_status: {item['llm_status']}\nsignal_mode: {item['signal_mode']}")
     holds=[item for item in diagnostics.get("candidates",[]) if item["decision"]=="HOLD"]
     print("\nHOLD REASON")
     if not holds: print("none")
@@ -76,6 +82,7 @@ def main() -> int:
             state=broker.get_portfolio_state()
             print(json.dumps(state.model_dump(mode="json"),indent=2)); return 0
         app=BistBotApplication(settings,database,broker,notifier)
+        for status in app.provider_status(): print(status)
         if args.once or args.dry_run:
             summary=app.run_cycle(dry_run=args.dry_run)
             if args.once and args.verbose: print_verbose_diagnostics(app.last_diagnostics)

@@ -10,6 +10,7 @@ class KapProvider(Protocol):
 
 
 class MockKapProvider:
+    provider_mode = "MOCK"
     def __init__(self, events: Sequence[EventItem] = (), error: Exception | None = None):
         self.events, self.error = list(events), error
 
@@ -17,3 +18,8 @@ class MockKapProvider:
         if self.error: raise self.error
         wanted = set(symbols)
         return [event for event in self.events if event.symbol in wanted]
+
+
+class DisabledKapProvider:
+    provider_mode = "DISABLED"
+    def fetch(self,symbols: Sequence[str]) -> list[EventItem]: return []

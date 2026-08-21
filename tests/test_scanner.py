@@ -48,6 +48,14 @@ def test_volume_spike_increases_volume_score():
     assert "relative volume spike" in spike.reasons
 
 
+def test_zero_volume_quote_marker_uses_last_completed_volume():
+    closes=[100+i*.1 for i in range(30)]
+    history=bars("MARKER",closes,last_volume=0)
+    signal=scanner().scan({"MARKER":history},now=NOW)[0]
+    assert signal.metrics["latest_volume"]==200_000
+    assert signal.metrics["relative_volume"]==1
+
+
 def test_illiquid_symbol_is_filtered_out():
     result = scanner().scan({"ILLIQ":bars("ILLIQ",[10+i*.01 for i in range(30)],base_volume=1_000)}, now=NOW)
     assert result == []
@@ -79,4 +87,3 @@ def test_ranking_limit_tie_break_and_sqlite_recording(tmp_path):
     assert all(result[i].overall_scanner_score >= result[i+1].overall_scanner_score for i in range(39))
     assert database.query("SELECT COUNT(*) AS count FROM technical_signals")[0]["count"] == 40
     database.close()
-

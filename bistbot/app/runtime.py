@@ -6,11 +6,11 @@ from decimal import Decimal
 from bistbot.app.config import Settings
 from bistbot.app.models import Action,LLMAnalysisInput,RiskOrderRequest,TradeSignal
 from bistbot.broker.paper import PaperBroker
-from bistbot.intelligence.kap_provider import KapProvider,MockKapProvider
+from bistbot.intelligence.kap_provider import DisabledKapProvider,KapProvider
 from bistbot.intelligence.llm_provider import LLMAnalyst,LLMCompletion,LLMProvider
-from bistbot.intelligence.news_provider import MockNewsProvider,NewsProvider
+from bistbot.intelligence.news_provider import DisabledNewsProvider,NewsProvider
 from bistbot.intelligence.ranking import EventRanker
-from bistbot.market.provider import DemoMarketDataProvider,MarketDataProvider
+from bistbot.market.provider import MarketDataProvider,YahooBistProvider
 from bistbot.market.scanner import DeterministicMarketScanner
 from bistbot.notifications.base import SafeNotificationDispatcher
 from bistbot.risk.engine import DeterministicRiskEngine,GlobalKillSwitch
@@ -21,6 +21,7 @@ from bistbot.strategy.engine import DeterministicStrategyEngine
 
 
 class DisabledLLMProvider:
+    provider_mode = "DISABLED"
     def complete(self,*,system_prompt: str,input_json: str) -> LLMCompletion:
         raise RuntimeError("No external LLM provider configured")
 
@@ -31,17 +32,24 @@ class BistBotApplication:
                  *,market: MarketDataProvider|None=None,news: NewsProvider|None=None,kap: KapProvider|None=None,
                  llm_provider: LLMProvider|None=None,llm_model: str="disabled-v1"):
         self.settings,self.database,self.broker,self.notifier=settings,database,broker,notifier
-        self.market=market or DemoMarketDataProvider(); self.news=news or MockNewsProvider(); self.kap=kap or MockKapProvider()
+        self.market=market or YahooBistProvider(); self.news=news or DisabledNewsProvider(); self.kap=kap or DisabledKapProvider()
+        self.llm_provider=llm_provider or DisabledLLMProvider()
         self.event_repository=EventRepository(database)
         self.scanner=DeterministicMarketScanner(settings.scanner,TechnicalSignalRepository(database))
         self.ranker=EventRanker(settings.intelligence,self.news,self.kap,self.event_repository,
                                 IntelligenceRankingRepository(database))
-        self.analyst=LLMAnalyst(llm_provider or DisabledLLMProvider(),LLMAnalysisRepository(database),
+        self.analyst=LLMAnalyst(self.llm_provider,LLMAnalysisRepository(database),
             model_name=llm_model,max_candidates=settings.analysis_top_n)
         self.strategy=DeterministicStrategyEngine(settings.scoring)
         self.risk=DeterministicRiskEngine(settings.risk,RiskDecisionRepository(database),
                                            GlobalKillSwitch(SystemStateRepository(database)))
         self.last_diagnostics: dict={"scanner":[],"candidates":[],"risk":[]}
+
+    def provider_status(self) -> list[str]:
+        return [f"MarketDataProvider: {type(self.market).__name__} [{getattr(self.market,'provider_mode','DISABLED')}]",
+            f"NewsProvider: {type(self.news).__name__} [{getattr(self.news,'provider_mode','DISABLED')}]",
+            f"KapProvider: {type(self.kap).__name__} [{getattr(self.kap,'provider_mode','DISABLED')}]",
+            f"LLMProvider: {type(self.llm_provider).__name__} [{getattr(self.llm_provider,'provider_mode','DISABLED')}]" ]
 
     def run_cycle(self,*,now: datetime|None=None,dry_run: bool=False) -> dict:
         now=now or datetime.now(timezone.utc)
@@ -59,7 +67,12 @@ class BistBotApplication:
         scanner_diagnostics=[{"rank":rank,"symbol":item.symbol,"scanner_score":item.overall_scanner_score,
             "technical_score":item.technical_score,"momentum_score":item.momentum_score,
             "volume_score":item.volume_score,"trend_score":item.trend_score,
-            "liquidity_score":item.liquidity_score} for rank,item in enumerate(top_40,1)]
+            "liquidity_score":item.liquidity_score,"latest_price":item.metrics.get("latest_price"),
+            "latest_timestamp":item.timestamp.isoformat(),"average_volume":item.metrics.get("average_volume"),
+            "latest_volume":item.metrics.get("latest_volume"),"relative_volume":item.metrics.get("relative_volume"),
+            "ema9":item.metrics.get("ema_9"),"ema21":item.metrics.get("ema_21"),"rsi14":item.metrics.get("rsi_14"),
+            "atr14":item.metrics.get("atr_14"),"average_turnover_try":item.metrics.get("average_turnover_try"),
+            "trading_continuity":item.metrics.get("trading_continuity")} for rank,item in enumerate(top_40,1)]
         top_10=self.ranker.rank(top_40,limit=self.settings.analysis_top_n,now=processing_time)
         technical={item.symbol:item for item in top_40}
         inputs=[LLMAnalysisInput(symbol=item.symbol,technical_signal=technical[item.symbol],
@@ -75,8 +88,9 @@ class BistBotApplication:
                 "importance":analysis.importance,"catalyst_score":analysis.catalyst_score,
                 "priced_in_probability":analysis.priced_in_probability,"risk_score":analysis.risk_score,
                 "confidence":analysis.confidence,"action_bias":analysis.action_bias.value,
+                "llm_status":analysis.llm_status.value,"news_status":ranking[candidate.symbol].intelligence_status.value,
                 "final_score":strategy_decision.final_score,"decision":strategy_decision.action.value,
-                "reason":strategy_decision.reason}
+                "reason":strategy_decision.reason,"signal_mode":strategy_decision.signal_mode.value}
             candidate_diagnostics.append(detail)
             if strategy_decision.action is Action.HOLD: continue
             price=Decimal(str(market_results[candidate.symbol].snapshot.price))
@@ -108,7 +122,12 @@ class BistBotApplication:
         self.last_diagnostics={"scanner":scanner_diagnostics,"candidates":candidate_diagnostics,
                                "risk":risk_diagnostics,"thresholds":{"buy":self.settings.scoring.buy_threshold,
                                "sell":self.settings.scoring.sell_threshold}}
-        return {"symbols":len(symbols),"market_available":len(histories),"scanner_candidates":len(top_40),
+        invalid=getattr(self.market,"invalid_symbols",[])
+        failures={symbol:result.diagnostics.error_reason for symbol,result in market_results.items() if not result.available}
+        return {"symbols":len(symbols),"real_symbols_loaded":len(symbols),"invalid_symbols":invalid,
+            "market_data_success":len(histories),"market_data_failed":len(symbols)-len(histories),
+            "market_data_errors":failures,
+            "market_available":len(histories),"scanner_candidates":len(top_40),
             "llm_candidates":len(inputs),"buy_signals":sum(item.action is Action.BUY for item in decisions),
             "sell_signals":sum(item.action is Action.SELL for item in decisions),"holds":sum(item.action is Action.HOLD for item in decisions),
             "entry_orders":len(entry_orders),"exit_orders":len(exit_orders),"cash":str(state.cash),

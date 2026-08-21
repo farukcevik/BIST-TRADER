@@ -8,7 +8,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from bistbot.app.models import Action, LLMAnalysis, LLMAnalysisInput, LLMCompletion
+from bistbot.app.models import Action, LLMAnalysis, LLMAnalysisInput, LLMCompletion,LLMStatus
 from bistbot.storage.repositories import LLMAnalysisRepository
 
 
@@ -17,6 +17,7 @@ class LLMProvider(Protocol):
 
 
 class MockLLMProvider:
+    provider_mode = "MOCK"
     def __init__(self, responses: Sequence[LLMCompletion | Exception]):
         self.responses, self.calls = list(responses), []
 
@@ -28,7 +29,7 @@ class MockLLMProvider:
         return response
 
 
-PROMPT_VERSION = "llm-analysis-v1"
+PROMPT_VERSION = "llm-analysis-v2-missing-data"
 SYSTEM_PROMPT = """You are a bounded BIST evidence analyst. Use only the supplied technical data and events.
 Return one JSON object matching the requested schema. Never invent source IDs. Do not size or execute orders,
 change risk limits, or introduce facts absent from the input. If evidence is insufficient, return HOLD with
@@ -56,7 +57,8 @@ class LLMAnalyst:
         cached = self.repository.get(input_hash, self.model_name, self.prompt_version)
         if cached is not None: return cached
         if not candidate.events:
-            analysis = hold_analysis(candidate.symbol, "Insufficient supplied news/KAP evidence", confidence=0)
+            analysis = hold_analysis(candidate.symbol,"No relevant news/KAP event; LLM not required",confidence=0,
+                                     status=LLMStatus.NOT_REQUIRED)
             self.repository.add(input_hash=input_hash,market_state_hash=market_hash,event_hashes=event_hashes,
                 model_name=self.model_name,prompt_version=self.prompt_version,analysis=analysis,latency_ms=0,
                 input_tokens=None,output_tokens=None,total_tokens=None,status="INSUFFICIENT_EVIDENCE")
@@ -74,7 +76,8 @@ class LLMAnalyst:
                 status = "MODEL_MISMATCH"
         except Exception as error:
             latency_ms = max(0.0,(self.clock()-started)*1000)
-            analysis = hold_analysis(candidate.symbol,f"LLM provider unavailable: {type(error).__name__}",confidence=0)
+            analysis = hold_analysis(candidate.symbol,f"LLM provider unavailable: {type(error).__name__}",confidence=0,
+                                     status=LLMStatus.UNAVAILABLE)
             status, tokens = "PROVIDER_ERROR", (None,None,None)
         self.repository.add(input_hash=input_hash,market_state_hash=market_hash,event_hashes=event_hashes,
             model_name=self.model_name,prompt_version=self.prompt_version,analysis=analysis,latency_ms=latency_ms,
@@ -121,10 +124,10 @@ def validate_analysis(payload: str, symbol: str, allowed_source_ids: set[str] | 
             raise ValueError("insufficient evidence")
         return result
     except (ValidationError,ValueError,TypeError):
-        return hold_analysis(symbol,"Invalid LLM response",confidence=0)
+        return hold_analysis(symbol,"Invalid LLM response",confidence=0,status=LLMStatus.INVALID)
 
 
-def hold_analysis(symbol: str, reason: str, confidence: int = 0) -> LLMAnalysis:
-    return LLMAnalysis(symbol=symbol,sentiment=0,importance=0,catalyst_score=0,priced_in_probability=100,
-        risk_score=100,confidence=min(confidence,40),time_horizon="none",action_bias=Action.HOLD,
-        summary=reason,bull_case="",bear_case=reason,risks=[reason],source_ids=[])
+def hold_analysis(symbol: str,reason: str,confidence: int=0,status: LLMStatus=LLMStatus.INVALID) -> LLMAnalysis:
+    return LLMAnalysis(symbol=symbol,sentiment=0,importance=0,catalyst_score=0,priced_in_probability=50,
+        risk_score=50,confidence=min(confidence,40),time_horizon="none",action_bias=Action.HOLD,
+        summary=reason,bull_case="",bear_case="",risks=[],source_ids=[],llm_status=status)

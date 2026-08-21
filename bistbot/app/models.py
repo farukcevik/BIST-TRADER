@@ -86,6 +86,23 @@ class EventSourceType(StrEnum):
     KAP = "KAP"
 
 
+class IntelligenceStatus(StrEnum):
+    NO_NEWS = "NO_NEWS"
+    EVENTS_AVAILABLE = "EVENTS_AVAILABLE"
+
+
+class LLMStatus(StrEnum):
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    NOT_REQUIRED = "NOT_REQUIRED"
+    INVALID = "INVALID"
+
+
+class SignalMode(StrEnum):
+    TECHNICAL_ONLY = "TECHNICAL_ONLY"
+    TECHNICAL_PLUS_NEWS = "TECHNICAL_PLUS_NEWS"
+
+
 class EventItem(BaseModel):
     id: str
     symbol: str
@@ -107,6 +124,7 @@ class RankedEventCandidate(BaseModel):
     combined_score: float = Field(ge=0, le=100)
     event_ids: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
+    intelligence_status: IntelligenceStatus = IntelligenceStatus.NO_NEWS
 
 
 class StrategyDecision(BaseModel):
@@ -114,6 +132,7 @@ class StrategyDecision(BaseModel):
     action: Action
     final_score: float = Field(ge=0,le=100)
     reason: str
+    signal_mode: SignalMode = SignalMode.TECHNICAL_ONLY
 
 
 class NewsItem(BaseModel):
@@ -143,6 +162,7 @@ class LLMAnalysis(BaseModel):
     bear_case: str
     risks: list[str] = Field(default_factory=list)
     source_ids: list[str] = Field(default_factory=list)
+    llm_status: LLMStatus = LLMStatus.AVAILABLE
 
 
 class LLMAnalysisInput(BaseModel):

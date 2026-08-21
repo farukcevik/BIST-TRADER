@@ -46,7 +46,7 @@ def test_valid_structured_analysis_and_metadata_storage(repository):
     result = LLMAnalyst(mock,repo,model_name="mock-v1").analyze([LLMAnalysisInput(symbol="AAA",technical_signal=technical(),events=[event])])[0]
     assert result.action_bias is Action.BUY and result.source_ids == [event.id]
     row = database.query("SELECT * FROM llm_analysis_cache")[0]
-    assert row["model_name"] == "mock-v1" and row["prompt_version"] == "llm-analysis-v1"
+    assert row["model_name"] == "mock-v1" and row["prompt_version"] == "llm-analysis-v2-missing-data"
     assert row["input_tokens"] == 120 and row["total_tokens"] == 200 and row["latency_ms"] >= 0
 
 
@@ -106,4 +106,3 @@ def test_candidate_limit_is_enforced(repository):
     _,repo = repository; analyst = LLMAnalyst(MockLLMProvider([]),repo,model_name="mock-v1")
     candidates = [LLMAnalysisInput(symbol=f"S{i}",technical_signal=technical(f"S{i}")) for i in range(11)]
     with pytest.raises(ValueError,match="candidate limit exceeded"): analyst.analyze(candidates)
-
