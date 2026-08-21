@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime,timedelta,timezone
+from decimal import Decimal,ROUND_HALF_UP
+from uuid import uuid4
+
+from bistbot.app.config import RiskSettings
+from bistbot.app.models import (Action,ExitReason,OrderStatus,PaperFill,PaperOrder,RiskDecision,
+                                RiskOutcome,RiskReasonCode,TradeSignal)
+from bistbot.notifications.base import SafeNotificationDispatcher
+from bistbot.portfolio.service import PortfolioPosition,money
+from bistbot.storage.database import Database
+
+PRICE_STEP=Decimal("0.0001")
+
+
+class PaperBroker:
+    """The only V1 execution adapter. All state is virtual and SQLite-backed."""
+    def __init__(self,starting_cash: Decimal|str|int|float=Decimal("200000"),commission_pct: float=0,
+                 slippage_pct: float=0,*,database: Database|None=None,risk_settings: RiskSettings|None=None,
+                 notifier: SafeNotificationDispatcher|None=None):
+        self.database=database or Database(":memory:"); self.risk_settings=risk_settings
+        self.commission_pct=Decimal(str(commission_pct)); self.slippage_pct=Decimal(str(slippage_pct))
+        self.notifier=notifier or SafeNotificationDispatcher()
+        capital=money(starting_cash)
+        if capital<=0 or self.commission_pct<0 or self.slippage_pct<0: raise ValueError("invalid paper broker configuration")
+        self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_cash',?)",(str(capital),))
+
+    def get_cash(self) -> Decimal:
+        return money(self.database.query("SELECT value FROM metadata WHERE key='paper_cash'")[0]["value"])
+
+    def get_positions(self) -> dict[str,PortfolioPosition]:
+        positions={}
+        for row in self.database.query("SELECT * FROM paper_positions"):
+            positions[row["symbol"]]=PortfolioPosition(symbol=row["symbol"],quantity=row["quantity"],
+                average_price=Decimal(row["average_price"]),last_price=Decimal(row["last_price"]),
+                opened_at=datetime.fromisoformat(row["opened_at"]),updated_at=datetime.fromisoformat(row["updated_at"]))
+        return positions
+
+    def get_orders(self) -> list[PaperOrder]:
+        return [PaperOrder.model_validate_json(row["payload"]) for row in self.database.query("SELECT payload FROM paper_orders ORDER BY timestamp,id")]
+
+    def get_portfolio_value(self,prices: dict[str,Decimal]|None=None) -> Decimal:
+        prices=prices or {}
+        return money(self.get_cash()+sum((position.quantity*Decimal(str(prices.get(symbol,position.last_price)))
+                     for symbol,position in self.get_positions().items()),Decimal("0")))
+
+    def buy(self,signal: TradeSignal,risk_decision: RiskDecision) -> PaperOrder:
+        if signal.action is not Action.BUY: raise ValueError("buy requires BUY signal")
+        if risk_decision.signal_id!=signal.id or not risk_decision.approved:
+            self.notify_risk_rejection(signal.symbol,risk_decision); raise PermissionError("risk decision does not approve this signal")
+        return self._fill(signal,risk_decision.approved_quantity,risk_decision)
+
+    def sell(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision) -> PaperOrder:
+        if signal.action is not Action.SELL: raise ValueError("sell requires SELL signal")
+        if (risk_decision.signal_id!=signal.id or not risk_decision.approved or
+                quantity>risk_decision.approved_quantity): raise PermissionError("sell is not approved")
+        return self._fill(signal,quantity,risk_decision)
+
+    def _fill(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision) -> PaperOrder:
+        if quantity<=0: raise ValueError("quantity must be positive")
+        requested=Decimal(str(signal.requested_price)); side_multiplier=(Decimal("1")+self.slippage_pct
+            if signal.action is Action.BUY else Decimal("1")-self.slippage_pct)
+        fill=(requested*side_multiplier).quantize(PRICE_STEP,rounding=ROUND_HALF_UP)
+        commission=money(fill*quantity*self.commission_pct); now=signal.timestamp
+        positions=self.get_positions(); old=positions.get(signal.symbol); cash=self.get_cash()
+        high_rows=self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(signal.symbol,))
+        stored_high=Decimal(high_rows[0]["high_price"]) if high_rows else fill
+        if signal.action is Action.BUY:
+            total=money(fill*quantity+commission)
+            if total>cash: raise ValueError("insufficient paper cash")
+            new_cash=money(cash-total)
+            if old:
+                new_quantity=old.quantity+quantity; average=(old.average_price*old.quantity+fill*quantity)/new_quantity
+                position=old.model_copy(update={"quantity":new_quantity,"average_price":money(average),
+                    "last_price":fill,"updated_at":now})
+            else: position=PortfolioPosition(symbol=signal.symbol,quantity=quantity,average_price=money(fill),
+                    last_price=fill,opened_at=now,updated_at=now)
+        else:
+            if not old or quantity>old.quantity: raise ValueError("insufficient paper position")
+            new_cash=money(cash+fill*quantity-commission); remaining=old.quantity-quantity
+            position=None if remaining==0 else old.model_copy(update={"quantity":remaining,"last_price":fill,"updated_at":now})
+        order=PaperOrder(signal_id=signal.id,symbol=signal.symbol,side=signal.action,quantity=quantity,
+            requested_price=requested,fill_price=fill,timestamp=now,reason=signal.reason,final_score=signal.score,
+            risk_decision=risk_decision,strategy_version=signal.strategy_version,status=OrderStatus.FILLED)
+        paper_fill=PaperFill(order_id=order.id,timestamp=now,symbol=signal.symbol,side=signal.action,
+                             quantity=quantity,fill_price=fill,commission=commission)
+        with self.database.connection:
+            connection=self.database.connection
+            connection.execute("UPDATE metadata SET value=? WHERE key='paper_cash'",(str(new_cash),))
+            if position is None: connection.execute("DELETE FROM paper_positions WHERE symbol=?",(signal.symbol,))
+            else: connection.execute("INSERT INTO paper_positions VALUES(?,?,?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET quantity=excluded.quantity,average_price=excluded.average_price,last_price=excluded.last_price,high_price=excluded.high_price,updated_at=excluded.updated_at",
+                (position.symbol,position.quantity,str(position.average_price),str(position.last_price),str(max(stored_high,fill)),position.opened_at.isoformat(),position.updated_at.isoformat()))
+            connection.execute("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(str(order.id),str(order.signal_id),order.symbol,order.side.value,order.quantity,str(order.requested_price),str(order.fill_price),order.timestamp.isoformat(),order.reason,order.final_score,order.risk_decision.model_dump_json(),order.strategy_version,order.status.value,order.model_dump_json()))
+            connection.execute("INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?)",(str(paper_fill.id),str(paper_fill.order_id),paper_fill.timestamp.isoformat(),paper_fill.symbol,paper_fill.side.value,paper_fill.quantity,str(paper_fill.fill_price),str(paper_fill.commission),paper_fill.model_dump_json()))
+        self.notifier.send("BUY" if signal.action is Action.BUY else "SELL",f"{signal.symbol} x{quantity} @ {fill}")
+        if signal.action is Action.SELL and signal.reason in {reason.value for reason in ExitReason}:
+            self.notifier.send(signal.reason,f"{signal.symbol} x{quantity} @ {fill}")
+        return order
+
+    def run_exit_checks(self,prices: dict[str,Decimal],*,strategy_exit_symbols: set[str]|None=None,
+                        now: datetime|None=None,strategy_version: str="v1") -> list[PaperOrder]:
+        """Must be invoked before each new-entry scan."""
+        if self.risk_settings is None: raise RuntimeError("risk settings are required for exit checks")
+        now=now or datetime.now(timezone.utc); strategy_exit_symbols=strategy_exit_symbols or set(); exits=[]
+        for symbol,position in list(self.get_positions().items()):
+            if symbol not in prices: continue
+            price=Decimal(str(prices[symbol])); high=self._update_high(symbol,price,now)
+            reason=None
+            if price<=position.average_price*(Decimal("1")-Decimal(str(self.risk_settings.default_stop_loss_pct))): reason=ExitReason.HARD_STOP
+            elif price>=position.average_price*(Decimal("1")+Decimal(str(self.risk_settings.default_take_profit_pct))): reason=ExitReason.TAKE_PROFIT
+            elif price<=high*(Decimal("1")-Decimal(str(self.risk_settings.default_trailing_stop_pct))): reason=ExitReason.TRAILING_STOP
+            elif symbol in strategy_exit_symbols: reason=ExitReason.STRATEGY_EXIT
+            elif now-position.opened_at>=timedelta(days=self.risk_settings.max_holding_days): reason=ExitReason.TIME_STOP
+            if reason:
+                signal=TradeSignal(symbol=symbol,action=Action.SELL,score=0,reason=reason.value,
+                    strategy_version=strategy_version,requested_price=float(price),timestamp=now)
+                decision=RiskDecision(signal_id=signal.id,outcome=RiskOutcome.APPROVE,reason_code=RiskReasonCode.APPROVED,
+                    reason=f"Deterministic {reason.value} exit",approved_quantity=position.quantity)
+                exits.append(self.sell(signal,position.quantity,decision))
+        return exits
+
+    def _update_high(self,symbol: str,price: Decimal,now: datetime) -> Decimal:
+        row=self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(symbol,))[0]
+        high=max(Decimal(row["high_price"]),price)
+        self.database.execute("UPDATE paper_positions SET high_price=?,last_price=?,updated_at=? WHERE symbol=?",
+                              (str(high),str(price),now.isoformat(),symbol))
+        return high
+
+    def cancel_order(self,order_id: str) -> bool:
+        rows=self.database.query("SELECT payload FROM paper_orders WHERE id=? AND status='PENDING'",(order_id,))
+        if not rows: return False
+        order=PaperOrder.model_validate_json(rows[0]["payload"]).model_copy(update={"status":OrderStatus.CANCELLED})
+        self.database.execute("UPDATE paper_orders SET status='CANCELLED',payload=? WHERE id=?",(order.model_dump_json(),order_id))
+        return True
+
+    def notify_risk_rejection(self,symbol: str,decision: RiskDecision) -> None:
+        important={RiskReasonCode.DAILY_LOSS_LIMIT,RiskReasonCode.WEEKLY_LOSS_LIMIT,
+                   RiskReasonCode.MAX_DRAWDOWN,RiskReasonCode.KILL_SWITCH}
+        if decision.reason_code in important or decision.outcome is RiskOutcome.HALT_TRADING:
+            self.notifier.send("RISK REJECTION",f"{symbol}: {decision.reason_code.value} — {decision.reason}")
+        if decision.outcome is RiskOutcome.HALT_TRADING:
+            self.notifier.send("TRADING HALTED",f"{decision.reason_code.value}: {decision.reason}")
+
+    # Compatibility aliases; canonical V1 interface uses get_*/cancel_order.
+    def cash(self): return self.get_cash()
+    def positions(self): return self.get_positions()
+    def orders(self): return self.get_orders()
+    def portfolio_value(self,prices=None): return self.get_portfolio_value(prices)
+    def cancel(self,order_id: str): return self.cancel_order(order_id)
