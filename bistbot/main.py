@@ -6,6 +6,8 @@ import logging
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from .app.config import load_settings
 from .app.runtime import BistBotApplication
 from .app.scheduler import Scheduler
@@ -16,6 +18,15 @@ from .notifications.macos import MacOSNotificationProvider
 from .notifications.telegram import TelegramNotificationProvider
 from .intelligence.openai_provider import OpenAILLMProvider
 from .storage.database import Database
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ENV_FILE = PROJECT_ROOT / ".env"
+
+
+def load_project_environment() -> bool:
+    load_dotenv(dotenv_path=PROJECT_ENV_FILE, override=False)
+    return bool(os.getenv("OPENAI_API_KEY"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,6 +76,7 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
 
 
 def main() -> int:
+    openai_key_configured=load_project_environment()
     parser=build_parser()
     args=parser.parse_args(); logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings=load_settings(args.config,args.capital); database=Database(settings.database)
@@ -83,6 +95,7 @@ def main() -> int:
         if args.report:
             state=broker.get_portfolio_state()
             print(json.dumps(state.model_dump(mode="json"),indent=2)); return 0
+        print(f"OPENAI_API_KEY: {'configured' if openai_key_configured else 'missing'}")
         llm_provider=None
         if settings.llm.enabled and settings.llm.provider.lower()=="openai" and os.getenv("OPENAI_API_KEY"):
             llm_provider=OpenAILLMProvider(model=settings.llm.model,api_key=os.environ["OPENAI_API_KEY"],

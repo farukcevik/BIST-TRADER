@@ -3,3 +3,4 @@ PyYAML>=6.0,<7
 pytest>=8.0,<10
 certifi>=2025.0
 openai>=1.0
+python-dotenv>=1.0
