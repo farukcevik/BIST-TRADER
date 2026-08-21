@@ -26,6 +26,19 @@ class ExecutionSettings(BaseModel):
     slippage_pct: float = Field(ge=0)
 
 
+class LLMSettings(BaseModel):
+    provider: str = "disabled"
+    model: str = ""
+    enabled: bool = False
+    timeout_seconds: float = Field(default=30, gt=0)
+
+    @model_validator(mode="after")
+    def openai_requires_model(self) -> "LLMSettings":
+        if self.enabled and self.provider.lower() == "openai" and not self.model.strip():
+            raise ValueError("llm.model is required when the OpenAI provider is enabled")
+        return self
+
+
 class ScoringSettings(BaseModel):
     technical: float = Field(ge=0)
     momentum: float = Field(ge=0)
@@ -112,6 +125,7 @@ class Settings(BaseModel):
     scoring: ScoringSettings
     scanner: ScannerSettings
     intelligence: IntelligenceSettings
+    llm: LLMSettings = Field(default_factory=LLMSettings)
 
 
 def load_settings(path: str | Path = "config.yaml", capital: float | None = None) -> Settings:
@@ -158,6 +172,7 @@ def _normalize_alternate_config(source: dict) -> dict:
             "default_trailing_stop_pct":exits.get("trailing_stop_pct",.035),
             "max_holding_days":exits.get("max_holding_days",20),"max_price_age_minutes":risk.get("max_price_age_minutes",5)},
         "execution":{"commission_pct":paper.get("commission_pct",.001),"slippage_pct":paper.get("slippage_pct",.0005)},
+        "llm":source.get("llm",{}),
         "scoring":{**{key:final_score.get(key,value) for key,value in {"technical":.3,"momentum":.2,"volume":.15,
             "news_kap":.2,"llm":.15}.items()},"buy_threshold":strategy.get("buy_threshold",65),
             "sell_threshold":strategy.get("sell_threshold",35)}}

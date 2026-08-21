@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 from .app.config import load_settings
@@ -13,6 +14,7 @@ from .notifications.base import SafeNotificationDispatcher
 from .notifications.email import EmailNotificationProvider
 from .notifications.macos import MacOSNotificationProvider
 from .notifications.telegram import TelegramNotificationProvider
+from .intelligence.openai_provider import OpenAILLMProvider
 from .storage.database import Database
 
 
@@ -81,7 +83,12 @@ def main() -> int:
         if args.report:
             state=broker.get_portfolio_state()
             print(json.dumps(state.model_dump(mode="json"),indent=2)); return 0
-        app=BistBotApplication(settings,database,broker,notifier)
+        llm_provider=None
+        if settings.llm.enabled and settings.llm.provider.lower()=="openai" and os.getenv("OPENAI_API_KEY"):
+            llm_provider=OpenAILLMProvider(model=settings.llm.model,api_key=os.environ["OPENAI_API_KEY"],
+                                           timeout_seconds=settings.llm.timeout_seconds)
+        llm_model=settings.llm.model if llm_provider else "disabled-v1"
+        app=BistBotApplication(settings,database,broker,notifier,llm_provider=llm_provider,llm_model=llm_model)
         for status in app.provider_status(): print(status)
         if args.once or args.dry_run:
             summary=app.run_cycle(dry_run=args.dry_run)

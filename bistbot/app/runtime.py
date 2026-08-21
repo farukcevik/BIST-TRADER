@@ -49,7 +49,8 @@ class BistBotApplication:
         return [f"MarketDataProvider: {type(self.market).__name__} [{getattr(self.market,'provider_mode','DISABLED')}]",
             f"NewsProvider: {type(self.news).__name__} [{getattr(self.news,'provider_mode','DISABLED')}]",
             f"KapProvider: {type(self.kap).__name__} [{getattr(self.kap,'provider_mode','DISABLED')}]",
-            f"LLMProvider: {type(self.llm_provider).__name__} [{getattr(self.llm_provider,'provider_mode','DISABLED')}]" ]
+            f"LLMProvider: {type(self.llm_provider).__name__} [{getattr(self.llm_provider,'provider_mode','DISABLED')}]",
+            *([f"LLMModel: {self.analyst.model_name}"] if getattr(self.llm_provider,'provider_mode','DISABLED')=="REAL" else [])]
 
     def run_cycle(self,*,now: datetime|None=None,dry_run: bool=False) -> dict:
         now=now or datetime.now(timezone.utc)
