@@ -65,6 +65,7 @@ class DeterministicMarketScanner:
             return None
         momentum_score = _clamp(50 + one_bar*3 + momentum_3*2 + momentum_12)
         trend_spread = return_pct(ema_9, ema_21)
+        trend_score = _clamp(50 + trend_spread*7)
         rsi_adjustment = 10 if 50 <= rsi_14 <= 70 else (-25 if rsi_14 >= 80 else -8 if rsi_14 >= 70 else 0)
         technical_score = _clamp(50 + trend_spread*7 + (12 if breakout else recent_high_distance*.5) + rsi_adjustment)
         if rsi_14 >= 80:
@@ -85,7 +86,7 @@ class DeterministicMarketScanner:
         if breakout: reasons.append("recent-high breakout")
         if rsi_14 >= 80: reasons.append("overbought RSI penalty")
         return TechnicalSignal(symbol=symbol, timestamp=bars[-1].timestamp,
-            technical_score=technical_score, momentum_score=momentum_score, volume_score=volume_score,
+            technical_score=technical_score, momentum_score=momentum_score, volume_score=volume_score,trend_score=trend_score,
             liquidity_score=liquidity_score, volatility_score=volatility_score,
             overall_scanner_score=overall, metrics={"return_1":one_bar,"momentum_3":momentum_3,
             "momentum_12":momentum_12,"relative_volume":relative_volume,"ema_9":ema_9,"ema_21":ema_21,

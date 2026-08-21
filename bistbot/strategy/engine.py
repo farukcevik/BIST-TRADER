@@ -24,5 +24,12 @@ class DeterministicStrategyEngine:
                 "volume":technical.volume_score,"news_kap":ranking.event_score,"llm":llm_score}
             score=weighted_score(components,weights)
             action=Action.BUY if analysis.action_bias is Action.BUY and score>=self.settings.buy_threshold else Action.HOLD
-        return StrategyDecision(symbol=technical.symbol,action=action,final_score=round(score,4),
-            reason=f"configured final score={score:.2f}; analyst bias={analysis.action_bias.value}")
+        if action is not Action.HOLD:
+            reason=f"final_score {score:.2f} passed configured threshold"
+        elif analysis.action_bias is Action.HOLD:
+            reason="LLM action_bias is HOLD"
+        elif analysis.action_bias is Action.BUY:
+            reason=f"final_score {score:.2f} below buy_threshold {self.settings.buy_threshold:g}"
+        else:
+            reason=f"bearish final_score {score:.2f} below sell threshold {100-self.settings.sell_threshold:g}"
+        return StrategyDecision(symbol=technical.symbol,action=action,final_score=round(score,4),reason=reason)

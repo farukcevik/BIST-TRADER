@@ -41,6 +41,7 @@ class BistBotApplication:
         self.strategy=DeterministicStrategyEngine(settings.scoring)
         self.risk=DeterministicRiskEngine(settings.risk,RiskDecisionRepository(database),
                                            GlobalKillSwitch(SystemStateRepository(database)))
+        self.last_diagnostics: dict={"scanner":[],"candidates":[],"risk":[]}
 
     def run_cycle(self,*,now: datetime|None=None,dry_run: bool=False) -> dict:
         now=now or datetime.now(timezone.utc)
@@ -55,16 +56,28 @@ class BistBotApplication:
         histories={symbol:result.candles for symbol,result in market_results.items() if result.available}
         processing_time=max([now]+[candles[-1].timestamp for candles in histories.values() if candles])
         top_40=self.scanner.scan(histories,limit=self.settings.scanner_top_n,now=processing_time)
+        scanner_diagnostics=[{"rank":rank,"symbol":item.symbol,"scanner_score":item.overall_scanner_score,
+            "technical_score":item.technical_score,"momentum_score":item.momentum_score,
+            "volume_score":item.volume_score,"trend_score":item.trend_score,
+            "liquidity_score":item.liquidity_score} for rank,item in enumerate(top_40,1)]
         top_10=self.ranker.rank(top_40,limit=self.settings.analysis_top_n,now=processing_time)
         technical={item.symbol:item for item in top_40}
         inputs=[LLMAnalysisInput(symbol=item.symbol,technical_signal=technical[item.symbol],
                     events=self.event_repository.get_by_ids(item.event_ids),
                     portfolio_exposure_pct=self._exposure_pct(item.symbol,market_results)) for item in top_10]
-        analyses=self.analyst.analyze(inputs); decisions=[]; entry_orders=[]
+        analyses=self.analyst.analyze(inputs); decisions=[]; entry_orders=[]; candidate_diagnostics=[]; risk_diagnostics=[]
         ranking={item.symbol:item for item in top_10}
         for candidate,analysis in zip(inputs,analyses):
             strategy_decision=self.strategy.evaluate(candidate.technical_signal,ranking[candidate.symbol],analysis)
             decisions.append(strategy_decision)
+            detail={"symbol":candidate.symbol,"scanner_score":candidate.technical_signal.overall_scanner_score,
+                "news_kap_score":ranking[candidate.symbol].event_score,"sentiment":analysis.sentiment,
+                "importance":analysis.importance,"catalyst_score":analysis.catalyst_score,
+                "priced_in_probability":analysis.priced_in_probability,"risk_score":analysis.risk_score,
+                "confidence":analysis.confidence,"action_bias":analysis.action_bias.value,
+                "final_score":strategy_decision.final_score,"decision":strategy_decision.action.value,
+                "reason":strategy_decision.reason}
+            candidate_diagnostics.append(detail)
             if strategy_decision.action is Action.HOLD: continue
             price=Decimal(str(market_results[candidate.symbol].snapshot.price))
             signal=TradeSignal(timestamp=processing_time,symbol=candidate.symbol,action=strategy_decision.action,
@@ -78,12 +91,23 @@ class BistBotApplication:
                 if signal.action is Action.BUY else None),price_timestamp=processing_time,
                 requested_quantity=position.quantity if signal.action is Action.SELL and position else None)
             risk_decision=self.risk.evaluate(request,state,processing_time)
+            risk_detail={"symbol":signal.symbol,"proposed_position_value":str(price*risk_decision.approved_quantity),
+                "proposed_quantity":risk_decision.approved_quantity,"stop_price":str(request.stop_price) if request.stop_price else None,
+                "maximum_allowed_risk":str(state.equity*Decimal(str(self.settings.risk.max_trade_risk_pct))),
+                "risk_decision":risk_decision.outcome.value,"reason_code":risk_decision.reason_code.value,
+                "reason":risk_decision.reason}
+            risk_diagnostics.append(risk_detail)
             if not risk_decision.approved:
+                detail["decision"]=Action.HOLD.value
+                detail["reason"]=f"RiskEngine rejected: {risk_decision.reason_code.value}"
                 self.broker.notify_risk_rejection(signal.symbol,risk_decision); continue
             if dry_run: continue
             if signal.action is Action.BUY: entry_orders.append(self.broker.buy(signal,risk_decision))
             elif position: entry_orders.append(self.broker.sell(signal,risk_decision.approved_quantity,risk_decision))
         state=self.broker.get_portfolio_state(now=processing_time,persist=not dry_run)
+        self.last_diagnostics={"scanner":scanner_diagnostics,"candidates":candidate_diagnostics,
+                               "risk":risk_diagnostics,"thresholds":{"buy":self.settings.scoring.buy_threshold,
+                               "sell":self.settings.scoring.sell_threshold}}
         return {"symbols":len(symbols),"market_available":len(histories),"scanner_candidates":len(top_40),
             "llm_candidates":len(inputs),"buy_signals":sum(item.action is Action.BUY for item in decisions),
             "sell_signals":sum(item.action is Action.SELL for item in decisions),"holds":sum(item.action is Action.HOLD for item in decisions),

@@ -73,6 +73,7 @@ class TechnicalSignal(BaseModel):
     technical_score: float = Field(ge=0, le=100)
     momentum_score: float = Field(ge=0, le=100)
     volume_score: float = Field(ge=0, le=100)
+    trend_score: float = Field(default=50,ge=0,le=100)
     liquidity_score: float = Field(ge=0, le=100)
     volatility_score: float = Field(ge=0, le=100)
     overall_scanner_score: float = Field(ge=0, le=100)
