@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from bistbot.app.config import ScannerSettings
 from bistbot.app.models import MarketBar, TechnicalSignal
@@ -21,7 +22,7 @@ class InvalidMarketData(ValueError):
 class DeterministicMarketScanner:
     """OHLCV-only first-stage scanner. This module never calls an LLM."""
     def __init__(self, settings: ScannerSettings, repository: TechnicalSignalRepository | None = None):
-        self.settings, self.repository = settings, repository
+        self.settings, self.repository = settings, repository; self.last_signals=[]
 
     def scan(self, histories: Mapping[str, Sequence[MarketBar]], limit: int = 40,
              now: datetime | None = None) -> list[TechnicalSignal]:
@@ -35,6 +36,7 @@ class DeterministicMarketScanner:
                 continue
             if signal is not None: signals.append(signal)
         signals.sort(key=lambda item: (-item.overall_scanner_score, item.symbol))
+        self.last_signals=list(signals)
         selected = signals[:limit]
         if self.repository:
             for rank, signal in enumerate(selected, 1): self.repository.add(signal, rank)
@@ -56,7 +58,18 @@ class DeterministicMarketScanner:
         breakout = close > prior_high
         completed=[index for index,volume in enumerate(volumes) if volume>0]
         if len(completed)<2: raise InvalidMarketData("insufficient completed volume bars")
-        volume_index=completed[-1]; history_indices=completed[:-1][-self.settings.relative_volume_lookback:]
+        volume_index=completed[-1]
+        istanbul=ZoneInfo("Europe/Istanbul")
+        latest_local=bars[volume_index].timestamp.astimezone(istanbul)
+        distinct_dates={bars[index].timestamp.astimezone(istanbul).date() for index in completed}
+        if len(distinct_dates)>1:
+            history_indices=[index for index in completed[:-1]
+                if bars[index].timestamp.astimezone(istanbul).hour==latest_local.hour][-self.settings.relative_volume_lookback:]
+            volume_method="SAME_HOURLY_INTERVAL_ISTANBUL"
+        else:
+            history_indices=completed[:-1][-self.settings.relative_volume_lookback:]
+            volume_method="ROLLING_EQUAL_DURATION"
+        if not history_indices: raise InvalidMarketData("no historical same-interval volume")
         rv_period=len(history_indices); latest_volume=volumes[volume_index]
         average_volume=sum(volumes[index] for index in history_indices)/rv_period
         relative_volume=latest_volume/average_volume if average_volume>0 else 0
@@ -98,6 +111,8 @@ class DeterministicMarketScanner:
             "rsi_14":rsi_14,"atr_14":atr_14,"atr_pct":atr_pct,"recent_high_distance":recent_high_distance,
             "breakout":breakout,"average_volume":average_volume,"average_turnover_try":average_turnover,
             "latest_price":close,"latest_volume":latest_volume,"trading_continuity":continuity,
+            "volume_method":volume_method,"current_interval_volume":latest_volume,
+            "historical_comparable_volume":average_volume,
             "volatility_pct":volatility}, reasons=reasons)
 
     def _validate(self, symbol: str, bars: Sequence[MarketBar], now: datetime) -> None:

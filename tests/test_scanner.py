@@ -48,6 +48,20 @@ def test_volume_spike_increases_volume_score():
     assert "relative volume spike" in spike.reasons
 
 
+def test_intraday_relative_volume_compares_same_time_of_day():
+    history=[]
+    for day in range(6):
+        for hour,volume in ((7,100_000),(8,400_000),(9,900_000),(10,200_000)):
+            history.append(MarketBar(symbol="RVOL",timestamp=datetime(2026,8,15+day,hour,tzinfo=timezone.utc),
+                open=100,high=101,low=99,close=100,volume=volume))
+    history.append(MarketBar(symbol="RVOL",timestamp=datetime(2026,8,21,7,tzinfo=timezone.utc),
+        open=100,high=101,low=99,close=100,volume=200_000))
+    result=scanner().score("RVOL",history,datetime(2026,8,21,7,tzinfo=timezone.utc))
+    assert result.metrics["volume_method"]=="SAME_HOURLY_INTERVAL_ISTANBUL"
+    assert result.metrics["historical_comparable_volume"]==100_000
+    assert result.metrics["relative_volume"]==2
+
+
 def test_zero_volume_quote_marker_uses_last_completed_volume():
     closes=[100+i*.1 for i in range(30)]
     history=bars("MARKER",closes,last_volume=0)

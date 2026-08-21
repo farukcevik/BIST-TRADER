@@ -52,12 +52,20 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
               f"relative_volume={item['relative_volume']} EMA9={item['ema9']} EMA21={item['ema21']} "
               f"RSI14={item['rsi14']} ATR14={item['atr14']} average_turnover_try={item['average_turnover_try']} "
               f"trading_continuity={item['trading_continuity']}")
+        print(f"    volume_method={item.get('volume_method','UNKNOWN')} current_interval_volume={item.get('current_interval_volume')} "
+              f"historical_comparable_volume={item.get('historical_comparable_volume')}")
+    print("\nSCANNER SCORE DISTRIBUTION")
+    for name,values in diagnostics.get("score_distribution",{}).items():
+        print(f"{name}: "+" ".join(f"{key}={value}" for key,value in values.items()))
+    providers=diagnostics.get("providers",{})
+    print(f"\nNewsProvider availability: {providers.get('news','UNKNOWN')}")
+    print(f"KapProvider availability: {providers.get('kap','UNKNOWN')}")
     print("\nTOP 10 INTELLIGENCE / LLM CANDIDATES")
     for item in diagnostics.get("candidates",[]):
         print(f"\n{item['symbol']}")
         for key in ("scanner_score","news_kap_score","sentiment","importance","catalyst_score",
-                    "priced_in_probability","risk_score","confidence","action_bias","final_score","decision","reason"):
-            print(f"{key}: {item[key]}")
+                    "priced_in_probability","risk_score","confidence","action_bias","model","final_score","decision","reason"):
+                print(f"{key}: {item.get(key)}")
         print(f"news_status: {item['news_status']}\nllm_status: {item['llm_status']}\nsignal_mode: {item['signal_mode']}")
     holds=[item for item in diagnostics.get("candidates",[]) if item["decision"]=="HOLD"]
     print("\nHOLD REASON")

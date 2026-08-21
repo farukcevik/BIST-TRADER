@@ -28,9 +28,9 @@ def event_hash(symbol: str, source: str, title: str, body: str) -> str:
 
 def make_event(*, symbol: str, source: str, source_type: EventSourceType, title: str,
                published_at: datetime, fetched_at: datetime, body: str = "", url: str | None = None,
-               trust_score: float) -> EventItem:
+               trust_score: float, source_id: str | None = None) -> EventItem:
     digest = event_hash(symbol, source, title, body)
-    return EventItem(id=digest[:24], symbol=symbol, source=source, source_type=source_type,
+    return EventItem(id=source_id or digest[:24], symbol=symbol, source=source, source_type=source_type,
         title=title, body=body, url=url, published_at=published_at, fetched_at=fetched_at,
         hash=digest, trust_score=trust_score)
 

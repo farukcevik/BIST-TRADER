@@ -43,6 +43,7 @@ class LLMAnalyst:
         if max_candidates <= 0: raise ValueError("max_candidates must be positive")
         self.provider, self.repository, self.model_name = provider, repository, model_name
         self.prompt_version, self.max_candidates, self.clock = prompt_version, max_candidates, clock
+        self.api_calls = 0; self.api_analyses_completed = 0
 
     def analyze(self, candidates: Sequence[LLMAnalysisInput]) -> list[LLMAnalysis]:
         if len(candidates) > self.max_candidates:
@@ -65,10 +66,12 @@ class LLMAnalyst:
             return analysis
         payload = self._prompt_payload(candidate); started = self.clock()
         try:
+            self.api_calls += 1
             completion = self.provider.complete(system_prompt=SYSTEM_PROMPT, input_json=json.dumps(payload,sort_keys=True,ensure_ascii=False))
             latency_ms = max(0.0,(self.clock()-started)*1000)
             analysis = validate_analysis(completion.content,candidate.symbol,{event.id for event in candidate.events})
             status = "VALID" if analysis.summary != "Invalid LLM response" else "INVALID_OUTPUT"
+            if status == "VALID": self.api_analyses_completed += 1
             tokens = (completion.input_tokens,completion.output_tokens,completion.total_tokens)
             actual_model = completion.model_name
             if actual_model != self.model_name:

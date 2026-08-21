@@ -75,7 +75,7 @@ class LLMAnalysisRepository:
     def __init__(self, database: Database): self.database = database
 
     def get(self, input_hash: str, model_name: str, prompt_version: str) -> LLMAnalysis | None:
-        rows = self.database.query("SELECT output FROM llm_analysis_cache WHERE input_hash=? AND model_name=? AND prompt_version=?",
+        rows = self.database.query("SELECT output FROM llm_analysis_cache WHERE input_hash=? AND model_name=? AND prompt_version=? AND status!='PROVIDER_ERROR'",
                                    (input_hash,model_name,prompt_version))
         return LLMAnalysis.model_validate_json(rows[0]["output"]) if rows else None
 

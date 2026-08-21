@@ -6,6 +6,7 @@ import random
 import re
 import time
 import urllib.request
+import urllib.parse
 import ssl
 import certifi
 from concurrent.futures import ThreadPoolExecutor,as_completed
@@ -13,6 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from bistbot.app.models import Candle, MarketDataResult, MarketSnapshot, ProviderDiagnostics
 
@@ -105,25 +107,25 @@ class DemoMarketDataProvider:
                 if symbol not in normalized: normalized.append(symbol)
             except ValueError as error:
                 key = raw_symbol.strip().upper() or raw_symbol
-                output[key] = self._result(key, (), self.now(), 0, 1, stale_after, str(error))
+                output[key] = self._result(key, (), self.now(), 0, 1, stale_after, str(error),interval)
         for start in range(0, len(normalized), self.batch_size):
             batch = normalized[start:start+self.batch_size]
             try:
                 payload, request_at, latency, attempts = self._request(batch, bars, interval)
                 for symbol in batch:
                     output[symbol] = self._result(symbol, payload.get(symbol, ()), request_at, latency,
-                                                  attempts, stale_after, None if symbol in payload else "symbol missing from response")
+                                                  attempts, stale_after, None if symbol in payload else "symbol missing from response",interval)
             except Exception as batch_error:
                 # A failed batch is retried per symbol so one bad ticker cannot discard its peers.
                 for symbol in batch:
                     try:
                         payload, request_at, latency, attempts = self._request([symbol], bars, interval)
                         output[symbol] = self._result(symbol, payload.get(symbol, ()), request_at, latency,
-                            attempts, stale_after, None if symbol in payload else "symbol missing from response")
+                            attempts, stale_after, None if symbol in payload else "symbol missing from response",interval)
                     except Exception as error:
                         requested = self.now()
                         output[symbol] = self._result(symbol, (), requested, 0, self.max_attempts,
-                                                      stale_after, f"{type(error).__name__}: {error}")
+                                                      stale_after, f"{type(error).__name__}: {error}",interval)
         return output
 
     def _request(self, symbols: Sequence[str], bars: int, interval: str):
@@ -141,13 +143,14 @@ class DemoMarketDataProvider:
         raise last_error
 
     def _result(self, symbol: str, raw: Sequence[Candle], request_at: datetime, latency_ms: float,
-                attempts: int, stale_after: timedelta, error: str | None) -> MarketDataResult:
+                attempts: int, stale_after: timedelta, error: str | None,interval: str) -> MarketDataResult:
         try:
             candles = sorted((Candle.model_validate(item) for item in raw), key=lambda item:item.timestamp)
             if not candles: raise ValueError(error or "no market data")
             if any(item.symbol != symbol for item in candles): raise ValueError("response symbol mismatch")
-            latest = candles[-1]; timestamp = _aware(latest.timestamp); age = _aware(self.now()) - timestamp
-            stale = age < timedelta(0) or age > stale_after
+            latest = candles[-1]; timestamp = _aware(latest.timestamp); current=_aware(self.now()); age = current - timestamp
+            interval_end=min(current,timestamp+_interval_delta(interval))
+            stale = _is_stale_for_bist_session(current,interval_end,stale_after)
             reason = error or (f"stale data: age={age}" if stale else None)
             snapshot = MarketSnapshot(symbol=symbol, timestamp=latest.timestamp, price=latest.close,
                 volume=latest.volume, fields={"open":latest.open,"high":latest.high,"low":latest.low,"close":latest.close},
@@ -172,6 +175,18 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def _is_stale_for_bist_session(now: datetime,data_timestamp: datetime,live_limit: timedelta) -> bool:
+    if data_timestamp>now:return True
+    zone=ZoneInfo("Europe/Istanbul"); local_now=now.astimezone(zone); local_data=data_timestamp.astimezone(zone)
+    market_live=local_now.weekday()<5 and (local_now.hour,local_now.minute)>=(10,0) and (local_now.hour,local_now.minute)<(18,10)
+    if market_live:return now-data_timestamp>live_limit
+    expected=local_now.date()
+    if (local_now.hour,local_now.minute)<(10,0) or local_now.weekday()>=5:
+        expected-=timedelta(days=1)
+        while expected.weekday()>=5: expected-=timedelta(days=1)
+    return local_data.date()<expected
+
+
 def _interval_delta(interval: str) -> timedelta:
     match = re.fullmatch(r"(\d+)([mhd])", interval)
     if not match: raise ValueError(f"unsupported interval: {interval}")
@@ -180,12 +195,28 @@ def _interval_delta(interval: str) -> timedelta:
 
 
 class BistSymbolUniverse:
-    def __init__(self,path: str|Path="data/bist_symbols.txt"): self.path=Path(path); self.invalid_symbols=[]
+    KAP_URL="https://www.kap.org.tr/tr/api/company/items/IGS/A"
+    def __init__(self,path: str|Path="data/bist_symbols.txt",*,opener=urllib.request.urlopen,timeout_seconds: float=15):
+        self.path=Path(path); self.invalid_symbols=[]; self.opener=opener; self.timeout_seconds=timeout_seconds
+        self.source="KAP_ACTIVE_IGS"; self.configured_count=0
     def load(self) -> list[str]:
+        try:
+            request=urllib.request.Request(self.KAP_URL,headers={"User-Agent":"BISTBOT/1.0","Referer":"https://www.kap.org.tr/"})
+            with self.opener(request,timeout=self.timeout_seconds) as response: payload=json.load(response)
+            raw=[]
+            for item in payload:
+                if str(item.get("payIslemDurumu")) != "1": continue
+                value=str(item.get("stockCode") or "")
+                raw.extend(part.strip() for part in re.split(r"[,;/ ]+",value) if part.strip())
+            if not raw: raise ValueError("KAP active company list was empty")
+        except Exception:
+            self.source="MAINTAINED_FALLBACK"
+            raw=[line.strip() for line in self.path.read_text(encoding="utf-8").splitlines()
+                 if line.strip() and not line.startswith("#")]
+        self.configured_count=len(raw)
         valid=[]; self.invalid_symbols=[]
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            symbol=line.strip().upper()
-            if not symbol or symbol.startswith("#"): continue
+        for value in raw:
+            symbol=value.strip().upper().removesuffix(".IS")
             if not re.fullmatch(r"[A-Z0-9]{3,6}",symbol): self.invalid_symbols.append(symbol); continue
             ticker=f"{symbol}.IS"
             if ticker not in valid: valid.append(ticker)
@@ -247,5 +278,7 @@ class YahooBistProvider(DemoMarketDataProvider):
     def active_symbols(self) -> list[str]: return self.universe.load()
     @property
     def invalid_symbols(self) -> list[str]: return list(self.universe.invalid_symbols)
+    @property
+    def symbols_configured(self) -> int: return self.universe.configured_count
     def intraday(self,symbols: Sequence[str],*,bars: int=60,interval: str="1h") -> dict[str,MarketDataResult]:
         return self._fetch(symbols,bars,interval,self.stale_after)

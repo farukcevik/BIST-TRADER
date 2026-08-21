@@ -77,7 +77,7 @@ class TechnicalSignal(BaseModel):
     liquidity_score: float = Field(ge=0, le=100)
     volatility_score: float = Field(ge=0, le=100)
     overall_scanner_score: float = Field(ge=0, le=100)
-    metrics: dict[str, float | bool]
+    metrics: dict[str, float | bool | str]
     reasons: list[str] = Field(default_factory=list)
 
 
