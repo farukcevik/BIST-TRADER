@@ -27,7 +27,7 @@ def event(symbol: str, source_type: EventSourceType, title: str, *, age_hours: i
 
 
 def ranker(news=(),kap=(),news_error=None,kap_error=None,repositories=(None,None)):
-    return EventRanker(load_settings().intelligence,MockNewsProvider(news,news_error),MockKapProvider(kap,kap_error),
+    return EventRanker(load_settings("config.v1.yaml").intelligence,MockNewsProvider(news,news_error),MockKapProvider(kap,kap_error),
                        repositories[0],repositories[1])
 
 

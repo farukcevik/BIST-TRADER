@@ -116,6 +116,48 @@ class Settings(BaseModel):
 
 def load_settings(path: str | Path = "config.yaml", capital: float | None = None) -> Settings:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if "system" in raw:
+        raw = _normalize_alternate_config(raw)
     if capital is not None:
         raw["capital"] = capital
     return Settings.model_validate(raw)
+
+
+def _normalize_alternate_config(source: dict) -> dict:
+    """Accept the early nested config layout while preserving V1 safety ceilings."""
+    portfolio=source.get("portfolio",{}); risk=source.get("risk",{}); exits=source.get("exit",{})
+    scanner=source.get("scanner",{}); scanner_weights=dict(scanner.get("weights",{}))
+    scanner_weights["volatility"]=scanner_weights.pop("trend",scanner_weights.get("volatility",.10))
+    intelligence=source.get("intelligence",{}); final_score=source.get("final_score",{})
+    strategy=source.get("strategy",{}); paper=source.get("paper",{}); scheduler=source.get("scheduler",{})
+    return {"capital":portfolio.get("initial_capital",200000),"database":source.get("database","bistbot.db"),
+        "strategy_version":source.get("system",{}).get("strategy_version","v1.0.0"),
+        "schedule_seconds":scheduler.get("market_scan_seconds",300),
+        "scanner_top_n":min(40,scanner.get("candidate_limit",40)),
+        "analysis_top_n":min(10,intelligence.get("max_llm_calls_per_cycle",10)),
+        "scanner":{"weights":scanner_weights,"minimum_bars":scanner.get("minimum_bars",22),
+            "recent_high_lookback":scanner.get("recent_high_lookback",20),
+            "relative_volume_lookback":scanner.get("relative_volume_lookback",20),
+            "max_data_age_minutes":scanner.get("max_data_age_minutes",30),
+            "minimum_average_volume":scanner.get("minimum_average_volume",100000),
+            "minimum_average_turnover_try":scanner.get("minimum_average_turnover_try",1000000),
+            "target_volatility_pct":scanner.get("target_volatility_pct",1.5),
+            "maximum_preferred_volatility_pct":scanner.get("maximum_preferred_volatility_pct",5.0)},
+        "intelligence":{"kap_trust_score":intelligence.get("kap_trust_score",95),
+            "news_trust_score":intelligence.get("news_trust_score",65),
+            "recency_half_life_hours":intelligence.get("recency_half_life_hours",24),
+            "scanner_weight":intelligence.get("scanner_weight",.4),"event_weight":intelligence.get("event_weight",.6),
+            "event_score_weights":intelligence.get("event_score_weights",{"recency":.25,"source_trust":.25,
+                "symbol_relevance":.2,"keywords":.15,"materiality":.15})},
+        "risk":{"max_open_positions":portfolio.get("max_open_positions",5),
+            "max_position_pct":portfolio.get("max_position_pct",.15),"min_cash_pct":portfolio.get("min_cash_pct",.15),
+            "max_trade_risk_pct":risk.get("max_trade_risk_pct",.005),"max_daily_loss_pct":risk.get("max_daily_loss_pct",.02),
+            "max_weekly_loss_pct":risk.get("max_weekly_loss_pct",.05),"max_total_drawdown_pct":risk.get("max_total_drawdown_pct",.10),
+            "default_stop_loss_pct":exits.get("default_stop_loss_pct",.04),
+            "default_take_profit_pct":exits.get("default_take_profit_pct",.08),
+            "default_trailing_stop_pct":exits.get("trailing_stop_pct",.035),
+            "max_holding_days":exits.get("max_holding_days",20),"max_price_age_minutes":risk.get("max_price_age_minutes",5)},
+        "execution":{"commission_pct":paper.get("commission_pct",.001),"slippage_pct":paper.get("slippage_pct",.0005)},
+        "scoring":{**{key:final_score.get(key,value) for key,value in {"technical":.3,"momentum":.2,"volume":.15,
+            "news_kap":.2,"llm":.15}.items()},"buy_threshold":strategy.get("buy_threshold",65),
+            "sell_threshold":strategy.get("sell_threshold",35)}}

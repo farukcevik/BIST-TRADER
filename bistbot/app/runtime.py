@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+from datetime import datetime,timezone
+from decimal import Decimal
+
+from bistbot.app.config import Settings
+from bistbot.app.models import Action,LLMAnalysisInput,RiskOrderRequest,TradeSignal
+from bistbot.broker.paper import PaperBroker
+from bistbot.intelligence.kap_provider import KapProvider,MockKapProvider
+from bistbot.intelligence.llm_provider import LLMAnalyst,LLMCompletion,LLMProvider
+from bistbot.intelligence.news_provider import MockNewsProvider,NewsProvider
+from bistbot.intelligence.ranking import EventRanker
+from bistbot.market.provider import DemoMarketDataProvider,MarketDataProvider
+from bistbot.market.scanner import DeterministicMarketScanner
+from bistbot.notifications.base import SafeNotificationDispatcher
+from bistbot.risk.engine import DeterministicRiskEngine,GlobalKillSwitch
+from bistbot.storage.database import Database
+from bistbot.storage.repositories import (EventRepository,IntelligenceRankingRepository,LLMAnalysisRepository,
+    RiskDecisionRepository,SystemStateRepository,TechnicalSignalRepository)
+from bistbot.strategy.engine import DeterministicStrategyEngine
+
+
+class DisabledLLMProvider:
+    def complete(self,*,system_prompt: str,input_json: str) -> LLMCompletion:
+        raise RuntimeError("No external LLM provider configured")
+
+
+class BistBotApplication:
+    """Composition root. Exit evaluation always precedes entry scanning."""
+    def __init__(self,settings: Settings,database: Database,broker: PaperBroker,notifier: SafeNotificationDispatcher,
+                 *,market: MarketDataProvider|None=None,news: NewsProvider|None=None,kap: KapProvider|None=None,
+                 llm_provider: LLMProvider|None=None,llm_model: str="disabled-v1"):
+        self.settings,self.database,self.broker,self.notifier=settings,database,broker,notifier
+        self.market=market or DemoMarketDataProvider(); self.news=news or MockNewsProvider(); self.kap=kap or MockKapProvider()
+        self.event_repository=EventRepository(database)
+        self.scanner=DeterministicMarketScanner(settings.scanner,TechnicalSignalRepository(database))
+        self.ranker=EventRanker(settings.intelligence,self.news,self.kap,self.event_repository,
+                                IntelligenceRankingRepository(database))
+        self.analyst=LLMAnalyst(llm_provider or DisabledLLMProvider(),LLMAnalysisRepository(database),
+            model_name=llm_model,max_candidates=settings.analysis_top_n)
+        self.strategy=DeterministicStrategyEngine(settings.scoring)
+        self.risk=DeterministicRiskEngine(settings.risk,RiskDecisionRepository(database),
+                                           GlobalKillSwitch(SystemStateRepository(database)))
+
+    def run_cycle(self,*,now: datetime|None=None,dry_run: bool=False) -> dict:
+        now=now or datetime.now(timezone.utc)
+        # Priority 1: refresh and evaluate every open position before scanning entries.
+        positions=self.broker.get_positions(); exit_orders=[]
+        if positions:
+            exit_data=self.market.snapshots(list(positions))
+            exit_prices={symbol:Decimal(str(result.snapshot.price)) for symbol,result in exit_data.items() if result.available}
+            if not dry_run: exit_orders=self.broker.run_exit_checks(exit_prices,now=now,strategy_version=self.settings.strategy_version)
+        symbols=self.market.active_symbols()
+        market_results=self.market.intraday(symbols,bars=max(60,self.settings.scanner.minimum_bars))
+        histories={symbol:result.candles for symbol,result in market_results.items() if result.available}
+        processing_time=max([now]+[candles[-1].timestamp for candles in histories.values() if candles])
+        top_40=self.scanner.scan(histories,limit=self.settings.scanner_top_n,now=processing_time)
+        top_10=self.ranker.rank(top_40,limit=self.settings.analysis_top_n,now=processing_time)
+        technical={item.symbol:item for item in top_40}
+        inputs=[LLMAnalysisInput(symbol=item.symbol,technical_signal=technical[item.symbol],
+                    events=self.event_repository.get_by_ids(item.event_ids),
+                    portfolio_exposure_pct=self._exposure_pct(item.symbol,market_results)) for item in top_10]
+        analyses=self.analyst.analyze(inputs); decisions=[]; entry_orders=[]
+        ranking={item.symbol:item for item in top_10}
+        for candidate,analysis in zip(inputs,analyses):
+            strategy_decision=self.strategy.evaluate(candidate.technical_signal,ranking[candidate.symbol],analysis)
+            decisions.append(strategy_decision)
+            if strategy_decision.action is Action.HOLD: continue
+            price=Decimal(str(market_results[candidate.symbol].snapshot.price))
+            signal=TradeSignal(timestamp=processing_time,symbol=candidate.symbol,action=strategy_decision.action,
+                score=strategy_decision.final_score,reason=strategy_decision.reason,
+                strategy_version=self.settings.strategy_version,requested_price=float(price))
+            state=self.broker.get_portfolio_state({symbol:Decimal(str(result.snapshot.price))
+                for symbol,result in market_results.items() if result.available},now=processing_time)
+            position=state.positions.get(candidate.symbol)
+            request=RiskOrderRequest(signal_id=signal.id,symbol=signal.symbol,action=signal.action,
+                entry_price=price,stop_price=(price*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))
+                if signal.action is Action.BUY else None),price_timestamp=processing_time,
+                requested_quantity=position.quantity if signal.action is Action.SELL and position else None)
+            risk_decision=self.risk.evaluate(request,state,processing_time)
+            if not risk_decision.approved:
+                self.broker.notify_risk_rejection(signal.symbol,risk_decision); continue
+            if dry_run: continue
+            if signal.action is Action.BUY: entry_orders.append(self.broker.buy(signal,risk_decision))
+            elif position: entry_orders.append(self.broker.sell(signal,risk_decision.approved_quantity,risk_decision))
+        state=self.broker.get_portfolio_state(now=processing_time,persist=not dry_run)
+        return {"symbols":len(symbols),"market_available":len(histories),"scanner_candidates":len(top_40),
+            "llm_candidates":len(inputs),"buy_signals":sum(item.action is Action.BUY for item in decisions),
+            "sell_signals":sum(item.action is Action.SELL for item in decisions),"holds":sum(item.action is Action.HOLD for item in decisions),
+            "entry_orders":len(entry_orders),"exit_orders":len(exit_orders),"cash":str(state.cash),
+            "portfolio_equity":str(state.equity),"dry_run":dry_run}
+
+    def _exposure_pct(self,symbol: str,market_results: dict) -> float:
+        state=self.broker.get_portfolio_state()
+        position=state.positions.get(symbol)
+        return 0.0 if not position or state.equity<=0 else float(position.market_value/state.equity*100)

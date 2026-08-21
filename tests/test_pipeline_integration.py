@@ -32,7 +32,7 @@ NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
 
 def test_stage_contracts_support_one_paper_buy(tmp_path):
     """One candidate can cross every boundary without hidden type conversion."""
-    settings = load_settings()
+    settings = load_settings("config.v1.yaml")
     provider = DemoMarketDataProvider(
         DemoTransport(lambda: NOW),
         now=lambda: NOW,

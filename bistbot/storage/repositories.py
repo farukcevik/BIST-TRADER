@@ -48,6 +48,16 @@ class EventRepository:
              event.published_at.isoformat(),event.fetched_at.isoformat(),event.hash,event.trust_score))
         return cursor.rowcount == 1
 
+    def get_by_ids(self,event_ids: list[str]) -> list[EventItem]:
+        if not event_ids: return []
+        placeholders=",".join("?" for _ in event_ids)
+        rows=self.database.query(f"SELECT * FROM event_items WHERE id IN ({placeholders})",event_ids)
+        by_id={row["id"]:EventItem(id=row["id"],symbol=row["symbol"],source=row["source"],
+            source_type=row["source_type"],title=row["title"],body=row["body"],url=row["url"],
+            published_at=row["published_at"],fetched_at=row["fetched_at"],hash=row["hash"],
+            trust_score=row["trust_score"]) for row in rows}
+        return [by_id[event_id] for event_id in event_ids if event_id in by_id]
+
 
 class IntelligenceRankingRepository:
     def __init__(self, database: Database): self.database = database

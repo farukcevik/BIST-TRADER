@@ -16,7 +16,7 @@ def signal(action: Action, price: float = 100) -> TradeSignal:
 
 
 def test_config_loads():
-    assert load_settings().risk.max_open_positions == 5
+    assert load_settings("config.v1.yaml").risk.max_open_positions == 5
 
 
 def test_schema_contains_required_tables(tmp_path):

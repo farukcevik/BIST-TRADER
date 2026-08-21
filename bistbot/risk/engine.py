@@ -26,14 +26,24 @@ class DeterministicRiskEngine:
 
     def evaluate(self,request: RiskOrderRequest,portfolio: PortfolioState,now: datetime | None=None) -> RiskDecision:
         now=now or datetime.now(timezone.utc)
-        if request.action is not Action.BUY:
+        if request.action not in {Action.BUY,Action.SELL}:
             return self._save(request,RiskOutcome.REJECT,RiskReasonCode.INVALID_REQUEST,"Risk entry validation accepts BUY proposals only")
-        if self.kill_switch.active:
+        if request.action is Action.BUY and self.kill_switch.active:
             return self._save(request,RiskOutcome.HALT_TRADING,RiskReasonCode.KILL_SWITCH,"Global kill switch is active")
         timestamp=request.price_timestamp if request.price_timestamp.tzinfo else request.price_timestamp.replace(tzinfo=timezone.utc)
         reference=now if now.tzinfo else now.replace(tzinfo=timezone.utc)
         if (reference-timestamp).total_seconds()<0 or reference-timestamp > timedelta(minutes=self.settings.max_price_age_minutes):
             return self._save(request,RiskOutcome.REJECT,RiskReasonCode.STALE_PRICE,"Price is stale or future-dated")
+        if request.action is Action.SELL:
+            position=portfolio.positions.get(request.symbol)
+            if position is None:
+                return self._save(request,RiskOutcome.REJECT,RiskReasonCode.INVALID_REQUEST,"No position available to sell")
+            requested=request.requested_quantity or position.quantity
+            quantity=min(requested,position.quantity)
+            outcome=RiskOutcome.REDUCE_SIZE if requested>position.quantity else RiskOutcome.APPROVE
+            code=RiskReasonCode.MAX_POSITION_SIZE if outcome is RiskOutcome.REDUCE_SIZE else RiskReasonCode.APPROVED
+            return self._save(request,outcome,code,"Position-reducing exit approved",quantity,
+                              {"position_quantity":position.quantity})
         if request.stop_price is None or request.stop_price<=0 or request.stop_price>=request.entry_price:
             return self._save(request,RiskOutcome.REJECT,RiskReasonCode.INVALID_STOP,"Stop must be positive and below entry")
         if portfolio.daily_pnl <= -portfolio.initial_capital*Decimal(str(self.settings.max_daily_loss_pct)):

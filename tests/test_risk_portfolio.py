@@ -20,7 +20,7 @@ NOW=datetime(2026,8,21,12,0,tzinfo=timezone.utc)
 @pytest.fixture
 def context(tmp_path):
     database=Database(str(tmp_path/"risk.db")); state_repo=SystemStateRepository(database)
-    engine=DeterministicRiskEngine(load_settings().risk,RiskDecisionRepository(database),GlobalKillSwitch(state_repo))
+    engine=DeterministicRiskEngine(load_settings("config.v1.yaml").risk,RiskDecisionRepository(database),GlobalKillSwitch(state_repo))
     yield database,state_repo,engine
     database.close()
 

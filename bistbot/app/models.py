@@ -108,6 +108,13 @@ class RankedEventCandidate(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+class StrategyDecision(BaseModel):
+    symbol: str
+    action: Action
+    final_score: float = Field(ge=0,le=100)
+    reason: str
+
+
 class NewsItem(BaseModel):
     source_id: str
     source: str
@@ -263,6 +270,7 @@ class PaperFill(BaseModel):
     quantity: int = Field(gt=0)
     fill_price: Decimal = Field(gt=0)
     commission: Decimal = Field(ge=0)
+    realized_pnl: Decimal = Decimal("0")
 
 
 class Position(BaseModel):

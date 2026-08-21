@@ -82,7 +82,7 @@ def test_rejected_buy_never_creates_order_and_notifies_important_rejection(tmp_p
 ])
 def test_position_exit_types(tmp_path,price,strategy,age_days,expected):
     database=Database(str(tmp_path/f"{expected}.db")); recorder=Recorder()
-    broker=PaperBroker(10_000,database=database,risk_settings=load_settings().risk,
+    broker=PaperBroker(10_000,database=database,risk_settings=load_settings("config.v1.yaml").risk,
                        notifier=SafeNotificationDispatcher([recorder]))
     buy_position(broker,timestamp=NOW-timedelta(days=age_days))
     exits=broker.run_exit_checks({"AAA":price},strategy_exit_symbols={"AAA"} if strategy else set(),now=NOW)
@@ -91,7 +91,7 @@ def test_position_exit_types(tmp_path,price,strategy,age_days,expected):
 
 
 def test_trailing_stop_uses_persisted_high_water_mark(tmp_path):
-    database=Database(str(tmp_path/"trail.db")); broker=PaperBroker(10_000,database=database,risk_settings=load_settings().risk)
+    database=Database(str(tmp_path/"trail.db")); broker=PaperBroker(10_000,database=database,risk_settings=load_settings("config.v1.yaml").risk)
     buy_position(broker)
     assert broker.run_exit_checks({"AAA":Decimal("107")},now=NOW+timedelta(minutes=1))==[]
     exits=broker.run_exit_checks({"AAA":Decimal("103")},now=NOW+timedelta(minutes=2))

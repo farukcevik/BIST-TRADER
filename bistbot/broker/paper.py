@@ -10,7 +10,9 @@ from bistbot.app.models import (Action,ExitReason,OrderStatus,PaperFill,PaperOrd
                                 RiskOutcome,RiskReasonCode,TradeSignal)
 from bistbot.notifications.base import SafeNotificationDispatcher
 from bistbot.portfolio.service import PortfolioPosition,money
+from bistbot.portfolio.service import PortfolioState
 from bistbot.storage.database import Database
+from bistbot.storage.repositories import RiskDecisionRepository,SystemStateRepository
 
 PRICE_STEP=Decimal("0.0001")
 
@@ -26,6 +28,8 @@ class PaperBroker:
         capital=money(starting_cash)
         if capital<=0 or self.commission_pct<0 or self.slippage_pct<0: raise ValueError("invalid paper broker configuration")
         self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_cash',?)",(str(capital),))
+        self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_initial_capital',?)",(str(capital),))
+        self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_realized_pnl','0.00')")
 
     def get_cash(self) -> Decimal:
         return money(self.database.query("SELECT value FROM metadata WHERE key='paper_cash'")[0]["value"])
@@ -45,6 +49,32 @@ class PaperBroker:
         prices=prices or {}
         return money(self.get_cash()+sum((position.quantity*Decimal(str(prices.get(symbol,position.last_price)))
                      for symbol,position in self.get_positions().items()),Decimal("0")))
+
+    def get_portfolio_state(self,prices: dict[str,Decimal]|None=None,*,now: datetime|None=None,
+                            persist: bool=False) -> PortfolioState:
+        now=now or datetime.now(timezone.utc); prices=prices or {}; positions=self.get_positions()
+        marked={symbol:position.model_copy(update={"last_price":Decimal(str(prices.get(symbol,position.last_price))),
+                "updated_at":now}) for symbol,position in positions.items()}
+        cash=self.get_cash(); equity=money(cash+sum((p.market_value for p in marked.values()),Decimal("0")))
+        unrealized=money(sum((p.unrealized_pnl for p in marked.values()),Decimal("0")))
+        realized=money(self.database.query("SELECT value FROM metadata WHERE key='paper_realized_pnl'")[0]["value"])
+        initial=money(self.database.query("SELECT value FROM metadata WHERE key='paper_initial_capital'")[0]["value"])
+        rows=self.database.query("SELECT timestamp,equity FROM paper_portfolio_snapshots ORDER BY timestamp")
+        history=[(datetime.fromisoformat(row["timestamp"]),money(row["equity"])) for row in rows]
+        peak=max([initial,equity]+[value for _,value in history])
+        def baseline(weekly: bool):
+            same=[(ts,value) for ts,value in history if (ts.isocalendar()[:2]==now.isocalendar()[:2] if weekly else ts.date()==now.date())]
+            earlier=[(ts,value) for ts,value in history if ts<now]
+            if same: return min(same,key=lambda item:item[0])[1]
+            return max(earlier,key=lambda item:item[0])[1] if earlier else initial
+        state=PortfolioState(as_of=now,initial_capital=initial,cash=cash,positions=marked,realized_pnl=realized,
+            unrealized_pnl=unrealized,equity=equity,daily_pnl=money(equity-baseline(False)),
+            weekly_pnl=money(equity-baseline(True)),peak_equity=peak,
+            drawdown_pct=Decimal("0") if peak==0 else (peak-equity)/peak)
+        if persist:
+            self.database.execute("INSERT INTO paper_portfolio_snapshots(timestamp,cash,equity,realized_pnl,unrealized_pnl) VALUES(?,?,?,?,?)",
+                (now.isoformat(),str(cash),str(equity),str(realized),str(unrealized)))
+        return state
 
     def buy(self,signal: TradeSignal,risk_decision: RiskDecision) -> PaperOrder:
         if signal.action is not Action.BUY: raise ValueError("buy requires BUY signal")
@@ -80,20 +110,25 @@ class PaperBroker:
         else:
             if not old or quantity>old.quantity: raise ValueError("insufficient paper position")
             new_cash=money(cash+fill*quantity-commission); remaining=old.quantity-quantity
+            realized=money((fill-old.average_price)*quantity-commission)
             position=None if remaining==0 else old.model_copy(update={"quantity":remaining,"last_price":fill,"updated_at":now})
         order=PaperOrder(signal_id=signal.id,symbol=signal.symbol,side=signal.action,quantity=quantity,
             requested_price=requested,fill_price=fill,timestamp=now,reason=signal.reason,final_score=signal.score,
             risk_decision=risk_decision,strategy_version=signal.strategy_version,status=OrderStatus.FILLED)
+        realized=Decimal("0") if signal.action is Action.BUY else realized
         paper_fill=PaperFill(order_id=order.id,timestamp=now,symbol=signal.symbol,side=signal.action,
-                             quantity=quantity,fill_price=fill,commission=commission)
+                             quantity=quantity,fill_price=fill,commission=commission,realized_pnl=realized)
         with self.database.connection:
             connection=self.database.connection
             connection.execute("UPDATE metadata SET value=? WHERE key='paper_cash'",(str(new_cash),))
+            if signal.action is Action.SELL:
+                current=Decimal(connection.execute("SELECT value FROM metadata WHERE key='paper_realized_pnl'").fetchone()[0])
+                connection.execute("UPDATE metadata SET value=? WHERE key='paper_realized_pnl'",(str(money(current+realized)),))
             if position is None: connection.execute("DELETE FROM paper_positions WHERE symbol=?",(signal.symbol,))
             else: connection.execute("INSERT INTO paper_positions VALUES(?,?,?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET quantity=excluded.quantity,average_price=excluded.average_price,last_price=excluded.last_price,high_price=excluded.high_price,updated_at=excluded.updated_at",
                 (position.symbol,position.quantity,str(position.average_price),str(position.last_price),str(max(stored_high,fill)),position.opened_at.isoformat(),position.updated_at.isoformat()))
             connection.execute("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(str(order.id),str(order.signal_id),order.symbol,order.side.value,order.quantity,str(order.requested_price),str(order.fill_price),order.timestamp.isoformat(),order.reason,order.final_score,order.risk_decision.model_dump_json(),order.strategy_version,order.status.value,order.model_dump_json()))
-            connection.execute("INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?)",(str(paper_fill.id),str(paper_fill.order_id),paper_fill.timestamp.isoformat(),paper_fill.symbol,paper_fill.side.value,paper_fill.quantity,str(paper_fill.fill_price),str(paper_fill.commission),paper_fill.model_dump_json()))
+            connection.execute("INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?,?)",(str(paper_fill.id),str(paper_fill.order_id),paper_fill.timestamp.isoformat(),paper_fill.symbol,paper_fill.side.value,paper_fill.quantity,str(paper_fill.fill_price),str(paper_fill.commission),str(paper_fill.realized_pnl),paper_fill.model_dump_json()))
         self.notifier.send("BUY" if signal.action is Action.BUY else "SELL",f"{signal.symbol} x{quantity} @ {fill}")
         if signal.action is Action.SELL and signal.reason in {reason.value for reason in ExitReason}:
             self.notifier.send(signal.reason,f"{signal.symbol} x{quantity} @ {fill}")
@@ -116,8 +151,13 @@ class PaperBroker:
             if reason:
                 signal=TradeSignal(symbol=symbol,action=Action.SELL,score=0,reason=reason.value,
                     strategy_version=strategy_version,requested_price=float(price),timestamp=now)
-                decision=RiskDecision(signal_id=signal.id,outcome=RiskOutcome.APPROVE,reason_code=RiskReasonCode.APPROVED,
-                    reason=f"Deterministic {reason.value} exit",approved_quantity=position.quantity)
+                from bistbot.risk.engine import DeterministicRiskEngine,GlobalKillSwitch
+                risk_engine=DeterministicRiskEngine(self.risk_settings,RiskDecisionRepository(self.database),
+                    GlobalKillSwitch(SystemStateRepository(self.database)))
+                state=self.get_portfolio_state({symbol:price},now=now)
+                from bistbot.app.models import RiskOrderRequest
+                decision=risk_engine.evaluate(RiskOrderRequest(signal_id=signal.id,symbol=symbol,action=Action.SELL,
+                    entry_price=price,price_timestamp=now,requested_quantity=position.quantity),state,now)
                 exits.append(self.sell(signal,position.quantity,decision))
         return exits
 

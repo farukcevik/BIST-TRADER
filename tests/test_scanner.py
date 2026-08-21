@@ -24,7 +24,7 @@ def bars(symbol: str, closes: list[float], *, base_volume: float = 200_000,
 
 
 def scanner(repository=None) -> DeterministicMarketScanner:
-    return DeterministicMarketScanner(load_settings().scanner, repository)
+    return DeterministicMarketScanner(load_settings("config.v1.yaml").scanner, repository)
 
 
 def test_strong_momentum_scores_above_weak_momentum():
