@@ -8,11 +8,22 @@ from .schema import SCHEMA
 
 
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, read_only: bool=False):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path)
+        self.connection = sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro",uri=True) if read_only else sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(SCHEMA)
+        if not read_only:
+            self.connection.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        columns={row["name"] for row in self.connection.execute("PRAGMA table_info(paper_positions)")}
+        additions={"current_score":"REAL","data_timestamp":"TEXT",
+                   "position_status":"TEXT NOT NULL DEFAULT 'UNKNOWN'"}
+        for name,declaration in additions.items():
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE paper_positions ADD COLUMN {name} {declaration}")
+        self.connection.commit()
 
     def execute(self, sql: str, parameters: Iterable[Any] = ()) -> sqlite3.Cursor:
         cursor = self.connection.execute(sql, tuple(parameters)); self.connection.commit(); return cursor
@@ -23,4 +34,3 @@ class Database:
     def close(self) -> None: self.connection.close()
     def __enter__(self) -> "Database": return self
     def __exit__(self, *args: object) -> None: self.close()
-

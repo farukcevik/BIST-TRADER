@@ -42,7 +42,7 @@ def test_real_kap_provider_maps_disclosure_with_stable_source_id():
                             now=lambda:datetime(2026,8,21,10,tzinfo=timezone.utc))
     events=provider.fetch(["THYAO.IS"])
     assert len(events)==1 and events[0].id=="kap:12345:THYAO" and events[0].symbol=="THYAO.IS"
-    assert events[0].url.endswith("/12345") and provider.availability=="AVAILABLE"
+    assert events[0].url.endswith("/12345") and provider.availability=="AVAILABLE_WITH_EVENTS"
 
 
 def test_real_news_provider_maps_only_actual_response_items():
@@ -54,7 +54,7 @@ def test_real_news_provider_maps_only_actual_response_items():
                                       now=lambda:datetime(2026,8,21,10,tzinfo=timezone.utc))
     events=provider.fetch(["THYAO.IS"])
     assert len(events)==1 and events[0].id=="yahoo:news-1:THYAO.IS"
-    assert events[0].title=="THYAO kapasite açıklaması" and provider.availability=="AVAILABLE"
+    assert events[0].title=="THYAO kapasite açıklaması" and provider.availability=="AVAILABLE_WITH_EVENTS"
 
 
 def test_yahoo_transport_normalizes_real_chart_response():
@@ -64,6 +64,19 @@ def test_yahoo_transport_normalizes_real_chart_response():
     def opener(request,timeout): return io.BytesIO(json.dumps(payload).encode())
     candles=YahooChartTransport(opener=opener,sleeper=lambda _:None)._one("THYAO.IS",60,"1h",5)
     assert candles[0].symbol=="THYAO.IS" and candles[0].close==301 and candles[0].volume==123456
+
+
+def test_yahoo_snapshot_uses_supported_one_minute_range():
+    timestamp=int(datetime(2026,8,21,12,0,tzinfo=timezone.utc).timestamp())
+    payload={"chart":{"result":[{"timestamp":[timestamp],"indicators":{"quote":[{
+        "open":[300],"high":[305],"low":[299],"close":[301],"volume":[123456]}]}}]}}
+    requested_urls=[]
+    def opener(request,timeout):
+        requested_urls.append(request.full_url)
+        return io.BytesIO(json.dumps(payload).encode())
+    YahooChartTransport(opener=opener,sleeper=lambda _:None)._one("THYAO.IS",1,"1m",5)
+    assert "range=5d" in requested_urls[0]
+    assert "interval=1m" in requested_urls[0]
 
 
 def test_current_session_close_is_not_stale_after_market_closes():

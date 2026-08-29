@@ -9,6 +9,7 @@ from bistbot.app.config import RiskSettings
 from bistbot.app.models import (Action,ExitReason,OrderStatus,PaperFill,PaperOrder,RiskDecision,
                                 RiskOutcome,RiskReasonCode,TradeSignal)
 from bistbot.notifications.base import SafeNotificationDispatcher
+from bistbot.market.calendar import BistTradingCalendar,MarketClosedError
 from bistbot.portfolio.service import PortfolioPosition,money
 from bistbot.portfolio.service import PortfolioState
 from bistbot.storage.database import Database
@@ -21,10 +22,11 @@ class PaperBroker:
     """The only V1 execution adapter. All state is virtual and SQLite-backed."""
     def __init__(self,starting_cash: Decimal|str|int|float=Decimal("200000"),commission_pct: float=0,
                  slippage_pct: float=0,*,database: Database|None=None,risk_settings: RiskSettings|None=None,
-                 notifier: SafeNotificationDispatcher|None=None):
+                 notifier: SafeNotificationDispatcher|None=None,calendar: BistTradingCalendar|None=None):
         self.database=database or Database(":memory:"); self.risk_settings=risk_settings
         self.commission_pct=Decimal(str(commission_pct)); self.slippage_pct=Decimal(str(slippage_pct))
         self.notifier=notifier or SafeNotificationDispatcher()
+        self.calendar=calendar or BistTradingCalendar()
         capital=money(starting_cash)
         if capital<=0 or self.commission_pct<0 or self.slippage_pct<0: raise ValueError("invalid paper broker configuration")
         self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_cash',?)",(str(capital),))
@@ -76,16 +78,19 @@ class PaperBroker:
                 (now.isoformat(),str(cash),str(equity),str(realized),str(unrealized)))
         return state
 
-    def buy(self,signal: TradeSignal,risk_decision: RiskDecision) -> PaperOrder:
+    def buy(self,signal: TradeSignal,risk_decision: RiskDecision,*,execution_time: datetime|None=None) -> PaperOrder:
         if signal.action is not Action.BUY: raise ValueError("buy requires BUY signal")
+        if signal.symbol in self.get_positions(): raise ValueError("existing paper position; pyramiding disabled")
         if risk_decision.signal_id!=signal.id or not risk_decision.approved:
             self.notify_risk_rejection(signal.symbol,risk_decision); raise PermissionError("risk decision does not approve this signal")
+        self._guard_execution(signal.timestamp,execution_time or signal.timestamp)
         return self._fill(signal,risk_decision.approved_quantity,risk_decision)
 
-    def sell(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision) -> PaperOrder:
+    def sell(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision,*,execution_time: datetime|None=None) -> PaperOrder:
         if signal.action is not Action.SELL: raise ValueError("sell requires SELL signal")
         if (risk_decision.signal_id!=signal.id or not risk_decision.approved or
                 quantity>risk_decision.approved_quantity): raise PermissionError("sell is not approved")
+        self._guard_execution(signal.timestamp,execution_time or signal.timestamp)
         return self._fill(signal,quantity,risk_decision)
 
     def _fill(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision) -> PaperOrder:
@@ -125,8 +130,8 @@ class PaperBroker:
                 current=Decimal(connection.execute("SELECT value FROM metadata WHERE key='paper_realized_pnl'").fetchone()[0])
                 connection.execute("UPDATE metadata SET value=? WHERE key='paper_realized_pnl'",(str(money(current+realized)),))
             if position is None: connection.execute("DELETE FROM paper_positions WHERE symbol=?",(signal.symbol,))
-            else: connection.execute("INSERT INTO paper_positions VALUES(?,?,?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET quantity=excluded.quantity,average_price=excluded.average_price,last_price=excluded.last_price,high_price=excluded.high_price,updated_at=excluded.updated_at",
-                (position.symbol,position.quantity,str(position.average_price),str(position.last_price),str(max(stored_high,fill)),position.opened_at.isoformat(),position.updated_at.isoformat()))
+            else: connection.execute("INSERT INTO paper_positions(symbol,quantity,average_price,last_price,high_price,opened_at,updated_at,data_timestamp,position_status) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET quantity=excluded.quantity,average_price=excluded.average_price,last_price=excluded.last_price,high_price=excluded.high_price,updated_at=excluded.updated_at,data_timestamp=excluded.data_timestamp,position_status=excluded.position_status",
+                (position.symbol,position.quantity,str(position.average_price),str(position.last_price),str(max(stored_high,fill)),position.opened_at.isoformat(),position.updated_at.isoformat(),position.updated_at.isoformat(),"FRESH"))
             connection.execute("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(str(order.id),str(order.signal_id),order.symbol,order.side.value,order.quantity,str(order.requested_price),str(order.fill_price),order.timestamp.isoformat(),order.reason,order.final_score,order.risk_decision.model_dump_json(),order.strategy_version,order.status.value,order.model_dump_json()))
             connection.execute("INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?,?)",(str(paper_fill.id),str(paper_fill.order_id),paper_fill.timestamp.isoformat(),paper_fill.symbol,paper_fill.side.value,paper_fill.quantity,str(paper_fill.fill_price),str(paper_fill.commission),str(paper_fill.realized_pnl),paper_fill.model_dump_json()))
         self.notifier.send("BUY" if signal.action is Action.BUY else "SELL",f"{signal.symbol} x{quantity} @ {fill}")
@@ -134,14 +139,33 @@ class PaperBroker:
             self.notifier.send(signal.reason,f"{signal.symbol} x{quantity} @ {fill}")
         return order
 
-    def run_exit_checks(self,prices: dict[str,Decimal],*,strategy_exit_symbols: set[str]|None=None,
-                        now: datetime|None=None,strategy_version: str="v1") -> list[PaperOrder]:
+    def refresh_position(self,symbol: str,price: Decimal,*,data_timestamp: datetime,current_score: float|None=None) -> Decimal:
+        """Persist one verified market mark. High-water mark can only increase."""
+        rows=self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(symbol,))
+        if not rows: raise KeyError(symbol)
+        high=max(Decimal(rows[0]["high_price"]),Decimal(str(price)))
+        self.database.execute("UPDATE paper_positions SET high_price=?,last_price=?,updated_at=?,data_timestamp=?,current_score=?,position_status='FRESH' WHERE symbol=?",
+            (str(high),str(price),data_timestamp.isoformat(),data_timestamp.isoformat(),current_score,symbol))
+        return high
+
+    def mark_position_stale(self,symbol: str) -> None:
+        self.database.execute("UPDATE paper_positions SET position_status='STALE_MARKET_DATA' WHERE symbol=?",(symbol,))
+
+    def run_exit_checks(self,prices: dict[str,Decimal],*,price_timestamps: dict[str,datetime]|None=None,
+                        strategy_exit_symbols: set[str]|None=None,
+                        now: datetime|None=None,strategy_version: str="v1",update_marks: bool=True) -> list[PaperOrder]:
         """Must be invoked before each new-entry scan."""
         if self.risk_settings is None: raise RuntimeError("risk settings are required for exit checks")
         now=now or datetime.now(timezone.utc); strategy_exit_symbols=strategy_exit_symbols or set(); exits=[]
+        price_timestamps=price_timestamps or {symbol:now for symbol in prices}
+        if not self.calendar.status(now).can_execute_orders:return exits
         for symbol,position in list(self.get_positions().items()):
             if symbol not in prices: continue
-            price=Decimal(str(prices[symbol])); high=self._update_high(symbol,price,now)
+            if not self.calendar.is_fresh_session_price(price_timestamps.get(symbol,now),now,
+                    timedelta(minutes=self.risk_settings.max_price_age_minutes)):continue
+            price=Decimal(str(prices[symbol]))
+            if update_marks: high=self._update_high(symbol,price,now)
+            else: high=Decimal(self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(symbol,))[0]["high_price"])
             reason=None
             if price<=position.average_price*(Decimal("1")-Decimal(str(self.risk_settings.default_stop_loss_pct))): reason=ExitReason.HARD_STOP
             elif price>=position.average_price*(Decimal("1")+Decimal(str(self.risk_settings.default_take_profit_pct))): reason=ExitReason.TAKE_PROFIT
@@ -150,7 +174,7 @@ class PaperBroker:
             elif now-position.opened_at>=timedelta(days=self.risk_settings.max_holding_days): reason=ExitReason.TIME_STOP
             if reason:
                 signal=TradeSignal(symbol=symbol,action=Action.SELL,score=0,reason=reason.value,
-                    strategy_version=strategy_version,requested_price=float(price),timestamp=now)
+                    strategy_version=strategy_version,requested_price=float(price),timestamp=price_timestamps.get(symbol,now))
                 from bistbot.risk.engine import DeterministicRiskEngine,GlobalKillSwitch
                 risk_engine=DeterministicRiskEngine(self.risk_settings,RiskDecisionRepository(self.database),
                     GlobalKillSwitch(SystemStateRepository(self.database)))
@@ -158,7 +182,7 @@ class PaperBroker:
                 from bistbot.app.models import RiskOrderRequest
                 decision=risk_engine.evaluate(RiskOrderRequest(signal_id=signal.id,symbol=symbol,action=Action.SELL,
                     entry_price=price,price_timestamp=now,requested_quantity=position.quantity),state,now)
-                exits.append(self.sell(signal,position.quantity,decision))
+                exits.append(self.sell(signal,position.quantity,decision,execution_time=now))
         return exits
 
     def _update_high(self,symbol: str,price: Decimal,now: datetime) -> Decimal:
@@ -167,6 +191,12 @@ class PaperBroker:
         self.database.execute("UPDATE paper_positions SET high_price=?,last_price=?,updated_at=? WHERE symbol=?",
                               (str(high),str(price),now.isoformat(),symbol))
         return high
+
+    def _guard_execution(self,price_timestamp:datetime,execution_time:datetime)->None:
+        self.calendar.require_executable(execution_time)
+        max_age=timedelta(minutes=self.risk_settings.max_price_age_minutes if self.risk_settings else 5)
+        if not self.calendar.is_fresh_session_price(price_timestamp,execution_time,max_age):
+            raise MarketClosedError("NO_FRESH_SESSION_PRICE")
 
     def cancel_order(self,order_id: str) -> bool:
         rows=self.database.query("SELECT payload FROM paper_orders WHERE id=? AND status='PENDING'",(order_id,))

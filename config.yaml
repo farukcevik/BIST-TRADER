@@ -1,60 +1,82 @@
-capital: 200000
-database: bistbot.db
-strategy_version: v1.0.0
-schedule_seconds: 300
-scanner_top_n: 40
-analysis_top_n: 10
-scanner:
-  weights:
-    technical: 0.30
-    momentum: 0.30
-    volume: 0.20
-    liquidity: 0.10
-    volatility: 0.10
-  minimum_bars: 22
-  recent_high_lookback: 20
-  relative_volume_lookback: 20
-  max_data_age_minutes: 30
-  minimum_average_volume: 100000
-  minimum_average_turnover_try: 1000000
-  target_volatility_pct: 1.5
-  maximum_preferred_volatility_pct: 5.0
-intelligence:
-  kap_trust_score: 95
-  news_trust_score: 65
-  recency_half_life_hours: 24
-  scanner_weight: 0.40
-  event_weight: 0.60
-  event_score_weights:
-    recency: 0.25
-    source_trust: 0.25
-    symbol_relevance: 0.20
-    keywords: 0.15
-    materiality: 0.15
+system:
+  mode: paper
+  strategy_version: "v1.0-aggressive"
+  timezone: "Europe/Istanbul"
+
+portfolio:
+  initial_capital: 200000
+  max_open_positions: 7
+  max_position_pct: 0.22
+  min_cash_pct: 0.05
+
 risk:
-  max_open_positions: 5
-  max_position_pct: 0.15
-  min_cash_pct: 0.15
-  max_trade_risk_pct: 0.005
-  max_daily_loss_pct: 0.02
-  max_weekly_loss_pct: 0.05
-  max_total_drawdown_pct: 0.10
-  default_stop_loss_pct: 0.04
-  default_take_profit_pct: 0.08
-  default_trailing_stop_pct: 0.035
-  max_holding_days: 20
-  max_price_age_minutes: 5
-execution:
-  commission_pct: 0.001
-  slippage_pct: 0.0005
-scoring:
-  technical: 0.30
-  momentum: 0.20
-  volume: 0.15
+  max_trade_risk_pct: 0.0125
+  max_daily_loss_pct: 0.04
+  max_weekly_loss_pct: 0.08
+  max_total_drawdown_pct: 0.15
+
+exit:
+  default_stop_loss_pct: 0.05
+  default_take_profit_pct: 0.10
+  trailing_stop_pct: 0.045
+
+scanner:
+  universe_limit: 523
+  candidate_limit: 50
+
+  weights:
+    technical: 0.25
+    momentum: 0.30
+    volume: 0.25
+    trend: 0.10
+    liquidity: 0.10
+
+intelligence:
+  news_candidate_limit: 15
+  max_llm_calls_per_cycle: 15
+  llm_materiality_threshold: 50
+
+final_score:
+  technical: 0.20
+  momentum: 0.25
+  volume: 0.20
   news_kap: 0.20
   llm: 0.15
-  buy_threshold: 65
-  sell_threshold: 35
+
+strategy:
+  buy_threshold: 72
+  strong_buy_threshold: 82
+  sell_threshold: 38
+
+paper:
+  commission_pct: 0.001
+  slippage_pct: 0.0015
+
+scheduler:
+  market_scan_seconds: 600
+  news_scan_seconds: 600
+
+notifications:
+  macos: true
+  telegram: true
+
+dashboard:
+  live_price_refresh_seconds: 30
+  email: false
+
+market_regime:
+  enabled: true
+  refresh_minutes: 45
+  high_materiality_threshold: 70
+  macro_llm_materiality_threshold: 70
+  sector_adjustment: 2
+  behaviors:
+    RISK_ON: {score_adjustment: 2, position_multiplier: 1.0}
+    NORMAL: {score_adjustment: 0, position_multiplier: 1.0}
+    CAUTION: {score_adjustment: -4, buy_threshold_adjustment: 3, position_multiplier: 0.75}
+    RISK_OFF: {score_adjustment: -10, buy_threshold_adjustment: 8, position_multiplier: 0.40}
+    CRISIS: {block_new_entries: true, position_multiplier: 0}
+
 llm:
   provider: openai
   model: gpt-5-mini

@@ -4,6 +4,20 @@ strategy_version: v1.0.0
 schedule_seconds: 300
 scanner_top_n: 40
 analysis_top_n: 10
+dashboard:
+  live_price_refresh_seconds: 30
+market_regime:
+  enabled: true
+  refresh_minutes: 45
+  high_materiality_threshold: 70
+  macro_llm_materiality_threshold: 70
+  sector_adjustment: 2
+  behaviors:
+    RISK_ON: {score_adjustment: 2, position_multiplier: 1.0}
+    NORMAL: {score_adjustment: 0, position_multiplier: 1.0}
+    CAUTION: {score_adjustment: -4, buy_threshold_adjustment: 3, position_multiplier: 0.75}
+    RISK_OFF: {score_adjustment: -10, buy_threshold_adjustment: 8, position_multiplier: 0.40}
+    CRISIS: {block_new_entries: true, position_multiplier: 0}
 scanner:
   weights: {technical: 0.30, momentum: 0.30, volume: 0.20, liquidity: 0.10, volatility: 0.10}
   minimum_bars: 22
@@ -18,6 +32,7 @@ intelligence:
   kap_trust_score: 95
   news_trust_score: 65
   recency_half_life_hours: 24
+  llm_materiality_threshold: 50
   scanner_weight: 0.40
   event_weight: 0.60
   event_score_weights: {recency: 0.25, source_trust: 0.25, symbol_relevance: 0.20, keywords: 0.15, materiality: 0.15}

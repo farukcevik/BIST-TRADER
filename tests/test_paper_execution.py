@@ -123,3 +123,11 @@ def test_cancel_filled_order_returns_false(tmp_path):
     order=buy_position(broker)
     assert broker.cancel_order(str(order.id)) is False
 
+
+def test_duplicate_buy_is_rejected_without_pyramiding(tmp_path):
+    database=Database(str(tmp_path/"duplicate.db")); broker=PaperBroker(10_000,database=database)
+    buy_position(broker); duplicate=signal()
+    with pytest.raises(ValueError,match="pyramiding disabled"):
+        broker.buy(duplicate,approved(duplicate,1))
+    assert broker.get_positions()["AAA"].quantity==10
+    assert len(broker.get_orders())==1

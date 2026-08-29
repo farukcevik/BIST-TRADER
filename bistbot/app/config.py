@@ -39,6 +39,32 @@ class LLMSettings(BaseModel):
         return self
 
 
+class DashboardSettings(BaseModel):
+    live_price_refresh_seconds: int = Field(default=30,ge=10,le=3600)
+
+
+class RegimeBehavior(BaseModel):
+    score_adjustment: float = 0
+    buy_threshold_adjustment: float = 0
+    position_multiplier: float = Field(default=1, ge=0, le=1)
+    block_new_entries: bool = False
+
+
+class MarketRegimeSettings(BaseModel):
+    enabled: bool = True
+    refresh_minutes: int = Field(default=45, ge=30, le=60)
+    high_materiality_threshold: float = Field(default=70, ge=0, le=100)
+    macro_llm_materiality_threshold: float = Field(default=70, ge=0, le=100)
+    sector_adjustment: float = Field(default=2, ge=0, le=10)
+    behaviors: dict[str, RegimeBehavior] = Field(default_factory=lambda: {
+        "RISK_ON": RegimeBehavior(score_adjustment=2),
+        "NORMAL": RegimeBehavior(),
+        "CAUTION": RegimeBehavior(score_adjustment=-4,buy_threshold_adjustment=3,position_multiplier=.75),
+        "RISK_OFF": RegimeBehavior(score_adjustment=-10,buy_threshold_adjustment=8,position_multiplier=.4),
+        "CRISIS": RegimeBehavior(block_new_entries=True,position_multiplier=0),
+    })
+
+
 class ScoringSettings(BaseModel):
     technical: float = Field(ge=0)
     momentum: float = Field(ge=0)
@@ -103,6 +129,7 @@ class IntelligenceSettings(BaseModel):
     scanner_weight: float = Field(ge=0, le=1)
     event_weight: float = Field(ge=0, le=1)
     event_score_weights: EventScoreWeights
+    llm_materiality_threshold: float = Field(default=50,ge=0,le=100)
 
     @model_validator(mode="after")
     def ranking_weights_sum_to_one(self) -> "IntelligenceSettings":
@@ -126,6 +153,8 @@ class Settings(BaseModel):
     scanner: ScannerSettings
     intelligence: IntelligenceSettings
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
+    market_regime: MarketRegimeSettings = Field(default_factory=MarketRegimeSettings)
 
 
 def load_settings(path: str | Path = "config.yaml", capital: float | None = None) -> Settings:
@@ -161,6 +190,7 @@ def _normalize_alternate_config(source: dict) -> dict:
             "news_trust_score":intelligence.get("news_trust_score",65),
             "recency_half_life_hours":intelligence.get("recency_half_life_hours",24),
             "scanner_weight":intelligence.get("scanner_weight",.4),"event_weight":intelligence.get("event_weight",.6),
+            "llm_materiality_threshold":intelligence.get("llm_materiality_threshold",50),
             "event_score_weights":intelligence.get("event_score_weights",{"recency":.25,"source_trust":.25,
                 "symbol_relevance":.2,"keywords":.15,"materiality":.15})},
         "risk":{"max_open_positions":portfolio.get("max_open_positions",5),
@@ -173,6 +203,8 @@ def _normalize_alternate_config(source: dict) -> dict:
             "max_holding_days":exits.get("max_holding_days",20),"max_price_age_minutes":risk.get("max_price_age_minutes",5)},
         "execution":{"commission_pct":paper.get("commission_pct",.001),"slippage_pct":paper.get("slippage_pct",.0005)},
         "llm":source.get("llm",{}),
+        "dashboard":source.get("dashboard",{}),
+        "market_regime":source.get("market_regime",{}),
         "scoring":{**{key:final_score.get(key,value) for key,value in {"technical":.3,"momentum":.2,"volume":.15,
             "news_kap":.2,"llm":.15}.items()},"buy_threshold":strategy.get("buy_threshold",65),
             "sell_threshold":strategy.get("sell_threshold",35)}}

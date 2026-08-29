@@ -243,7 +243,9 @@ class YahooChartTransport:
         return output
 
     def _one(self,symbol: str,bars: int,interval: str,timeout_seconds: float) -> list[Candle]:
-        range_value="1mo" if interval.endswith(("m","h")) else "6mo"
+        # Yahoo only exposes one-minute candles over short ranges.  A one-month
+        # range causes otherwise valid snapshot requests to return no result.
+        range_value="5d" if interval=="1m" else "1mo" if interval.endswith(("m","h")) else "6mo"
         url=f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range={range_value}&interval={interval}"
         last_error=None
         for attempt in range(self.retries+1):

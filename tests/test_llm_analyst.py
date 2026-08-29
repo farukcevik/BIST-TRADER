@@ -46,7 +46,7 @@ def test_valid_structured_analysis_and_metadata_storage(repository):
     result = LLMAnalyst(mock,repo,model_name="mock-v1").analyze([LLMAnalysisInput(symbol="AAA",technical_signal=technical(),events=[event])])[0]
     assert result.action_bias is Action.BUY and result.source_ids == [event.id]
     row = database.query("SELECT * FROM llm_analysis_cache")[0]
-    assert row["model_name"] == "mock-v1" and row["prompt_version"] == "llm-analysis-v2-missing-data"
+    assert row["model_name"] == "mock-v1" and row["prompt_version"] == "llm-analysis-v3-material-evidence"
     assert row["input_tokens"] == 120 and row["total_tokens"] == 200 and row["latency_ms"] >= 0
 
 
@@ -85,6 +85,14 @@ def test_market_state_change_triggers_new_call(repository):
     analyst.analyze([LLMAnalysisInput(symbol="AAA",technical_signal=technical(score=70),events=[event])])
     analyst.analyze([LLMAnalysisInput(symbol="AAA",technical_signal=technical(score=71),events=[event])])
     assert len(mock.calls) == 2
+
+def test_closed_market_event_driven_mode_reuses_event_cache_when_technical_state_changes(repository):
+    _,repo=repository; event=disclosure()
+    mock=MockLLMProvider([LLMCompletion(content=output(source_ids=[event.id]),model_name="mock-v1")])
+    analyst=LLMAnalyst(mock,repo,model_name="mock-v1")
+    analyst.analyze([LLMAnalysisInput(symbol="AAA",technical_signal=technical(score=70),events=[event])],event_driven=True)
+    analyst.analyze([LLMAnalysisInput(symbol="AAA",technical_signal=technical(score=71),events=[event])],event_driven=True)
+    assert len(mock.calls)==1 and analyst.cache_avoided_calls==1
 
 
 def test_only_supplied_event_content_enters_prompt(repository):

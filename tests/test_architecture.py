@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import sqlite3
 import pytest
 
@@ -12,7 +13,8 @@ from bistbot.storage.repositories import NewsRepository
 
 
 def signal(action: Action, price: float = 100) -> TradeSignal:
-    return TradeSignal(symbol="TEST", action=action, score=50, reason="test", strategy_version="test", requested_price=price)
+    return TradeSignal(symbol="TEST", action=action, score=50, reason="test", strategy_version="test", requested_price=price,
+        timestamp=datetime(2026,8,31,11,tzinfo=ZoneInfo("Europe/Istanbul")))
 
 
 def test_config_loads():

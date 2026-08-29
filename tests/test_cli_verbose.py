@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import subprocess
+from pathlib import Path
 
 import yaml
 
@@ -30,12 +32,30 @@ def test_parser_accepts_verbose_with_once():
     assert args.once and args.verbose and args.capital==200000
 
 
+def test_package_main_can_be_executed_directly_like_vscode():
+    project_root=Path(__file__).resolve().parents[1]
+    result=subprocess.run([sys.executable,str(project_root/"bistbot"/"main.py"),"--help"],
+        cwd=project_root/"bistbot",capture_output=True,text=True,timeout=15)
+    assert result.returncode==0
+    assert "BISTBOT V1 paper trader" in result.stdout
+
+
 def test_verbose_formatter_prints_scores_hold_reason_and_risk(capsys):
     cli.print_verbose_diagnostics(DIAGNOSTICS); output=capsys.readouterr().out
     assert "TOP 40 SCANNER CANDIDATES" in output and "trend_score=79.00" in output
     assert "TOP 10 INTELLIGENCE / LLM CANDIDATES" in output and "priced_in_probability: 45" in output
     assert "HOLD REASON" in output and "final_score 76.4 below buy_threshold 78" in output
     assert "RISK DECISION" in output and "reason_code: MAX_POSITION_SIZE" in output
+
+
+def test_cycle_summary_explains_raw_buy_blocked_by_existing_position(capsys):
+    diagnostics={"candidates":[{"symbol":"GUBRF.IS","final_score":72.509,"strategy_decision":"BUY",
+        "decision":"HOLD","reason":"existing paper position; pyramiding disabled"}]}
+    summary={"market_data_success":625,"symbols_valid":648,"scanner_candidates":40,"llm_candidates":10,
+        "llm_api_attempts":0,"raw_buy_signals":1,"buy_signals":0,"entry_orders":0,"exit_orders":0}
+    cli.print_cycle_action_summary(summary,diagnostics); output=capsys.readouterr().out
+    assert "strategy=BUY  action=MANAGE_EXISTING_POSITION" in output
+    assert "post-strategy portfolio/risk rules blocked" in output
 
 
 def test_once_verbose_keeps_json_summary_as_final_output(tmp_path,monkeypatch,capsys):

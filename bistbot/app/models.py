@@ -86,9 +86,125 @@ class EventSourceType(StrEnum):
     KAP = "KAP"
 
 
+class MarketRegime(StrEnum):
+    RISK_ON = "RISK_ON"
+    NORMAL = "NORMAL"
+    CAUTION = "CAUTION"
+    RISK_OFF = "RISK_OFF"
+    CRISIS = "CRISIS"
+
+
+class MacroRiskCategory(StrEnum):
+    TURKEY_MACRO = "turkey_macro_risk"
+    DOMESTIC_POLICY = "domestic_policy_risk"
+    GEOPOLITICAL = "geopolitical_risk"
+    GLOBAL_MARKET = "global_market_risk"
+    FX = "fx_risk"
+    COMMODITY = "commodity_risk"
+    SYSTEMIC_EVENT = "systemic_event_risk"
+
+
+class TimestampSource(StrEnum):
+    SOURCE = "SOURCE"
+    PARSED_PAGE = "PARSED_PAGE"
+    FETCH_FALLBACK = "FETCH_FALLBACK"
+
+
+class MacroEvent(BaseModel):
+    canonical_event_id: str
+    source_id: str
+    source: str
+    title: str
+    body: str = ""
+    url: str | None = None
+    published_at: datetime
+    fetched_at: datetime
+    timestamp_source: TimestampSource = TimestampSource.SOURCE
+    category: MacroRiskCategory
+    source_reliability: float = Field(ge=0, le=100)
+    materiality_score: float = Field(default=0, ge=0, le=100)
+    materiality: Literal["LOW", "MEDIUM", "HIGH"] = "LOW"
+    event_type: str = "ROUTINE"
+    age_hours: float = Field(default=0,ge=0)
+    freshness_weight: float = Field(default=1,ge=0,le=1)
+    effective_materiality: float = Field(default=0,ge=0,le=100)
+    confirmation_score: float = Field(default=100,ge=0,le=100)
+    regime_contribution: float = Field(default=0,ge=0,le=100)
+    direction: Literal["POSITIVE", "NEUTRAL", "NEGATIVE", "MIXED"] = "NEUTRAL"
+    affected_sectors: list[str] = Field(default_factory=list)
+    positive_sectors: list[str] = Field(default_factory=list)
+    negative_sectors: list[str] = Field(default_factory=list)
+
+
+class MarketRegimeState(BaseModel):
+    regime: MarketRegime = MarketRegime.NORMAL
+    market_risk_score: int = Field(default=0, ge=0, le=100)
+    confidence: int = Field(default=0, ge=0, le=100)
+    risk_categories: dict[str, int] = Field(default_factory=dict)
+    event_summary: str = "No material macro event"
+    expected_market_direction: str = "NEUTRAL"
+    expected_duration: str = "unknown"
+    affected_sectors: list[str] = Field(default_factory=list)
+    positive_sectors: list[str] = Field(default_factory=list)
+    negative_sectors: list[str] = Field(default_factory=list)
+    uncertainty: str = ""
+    source_ids: list[str] = Field(default_factory=list)
+    material_events: list[MacroEvent] = Field(default_factory=list)
+    last_updated: datetime = Field(default_factory=datetime.now)
+
+
+class MacroLLMAnalysis(BaseModel):
+    regime: MarketRegime
+    market_risk_score: int = Field(ge=0,le=100)
+    confidence: int = Field(ge=0,le=100)
+    event_summary: str
+    expected_market_direction: str
+    expected_duration: str
+    affected_sectors: list[str] = Field(default_factory=list)
+    positive_sectors: list[str] = Field(default_factory=list)
+    negative_sectors: list[str] = Field(default_factory=list)
+    uncertainty: str
+    source_ids: list[str]
+
+
+class MarketOverlay(BaseModel):
+    market_regime: MarketRegime
+    market_adjustment: float = 0
+    sector_adjustment: float = 0
+    buy_threshold_adjustment: float = 0
+    position_multiplier: float = Field(default=1, ge=0, le=1)
+    block_new_entries: bool = False
+
+
 class IntelligenceStatus(StrEnum):
     NO_NEWS = "NO_NEWS"
     EVENTS_AVAILABLE = "EVENTS_AVAILABLE"
+
+
+class ProviderState(StrEnum):
+    AVAILABLE_WITH_EVENTS = "AVAILABLE_WITH_EVENTS"
+    AVAILABLE_NO_EVENTS = "AVAILABLE_NO_EVENTS"
+    UNAVAILABLE = "UNAVAILABLE"
+    ERROR = "ERROR"
+
+
+class IntelligenceProviderDiagnostics(BaseModel):
+    provider: str
+    mode: str
+    endpoint: str | None = None
+    request_timestamp: datetime | None = None
+    http_status: int | None = None
+    response_size: int = Field(default=0, ge=0)
+    raw_events: int = Field(default=0, ge=0)
+    parsed_events: int = Field(default=0, ge=0)
+    mapped_events: int = Field(default=0, ge=0)
+    symbols_matched: int = Field(default=0, ge=0)
+    latency_ms: float = Field(default=0, ge=0)
+    retry_count: int = Field(default=0, ge=0)
+    status: ProviderState = ProviderState.UNAVAILABLE
+    latest_event: datetime | None = None
+    error_type: str | None = None
+    error_message: str | None = None
 
 
 class LLMStatus(StrEnum):
@@ -115,6 +231,11 @@ class EventItem(BaseModel):
     fetched_at: datetime
     hash: str
     trust_score: float = Field(ge=0, le=100)
+    event_type: str = "UNCLASSIFIED"
+    materiality_score: float = Field(default=0,ge=0,le=100)
+    source_reliability: float = Field(default=0,ge=0,le=100)
+    verification: str = "UNVERIFIED"
+    materiality_reason: str = ""
 
 
 class RankedEventCandidate(BaseModel):
@@ -133,6 +254,7 @@ class StrategyDecision(BaseModel):
     final_score: float = Field(ge=0,le=100)
     reason: str
     signal_mode: SignalMode = SignalMode.TECHNICAL_ONLY
+    score_breakdown: dict[str, Any] = Field(default_factory=dict)
 
 
 class NewsItem(BaseModel):

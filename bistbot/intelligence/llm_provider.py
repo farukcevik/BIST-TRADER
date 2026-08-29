@@ -29,11 +29,14 @@ class MockLLMProvider:
         return response
 
 
-PROMPT_VERSION = "llm-analysis-v2-missing-data"
+PROMPT_VERSION = "llm-analysis-v3-material-evidence"
 SYSTEM_PROMPT = """You are a bounded BIST evidence analyst. Use only the supplied technical data and events.
 Return one JSON object matching the requested schema. Never invent source IDs. Do not size or execute orders,
 change risk limits, or introduce facts absent from the input. If evidence is insufficient, return HOLD with
-confidence at most 40. Scores are 0-100, except sentiment is -100 to 100."""
+confidence at most 40. Never infer the meaning of an unclear disclosure title. If the supplied disclosure
+content does not establish its meaning, explicitly state UNKNOWN/INSUFFICIENT_CONTEXT. Ambiguous administrative
+events are neither bullish nor bearish. Assess only facts explicitly present in event content; a title alone
+cannot support high confidence. Scores are 0-100, except sentiment is -100 to 100."""
 
 
 class LLMAnalyst:
@@ -43,20 +46,23 @@ class LLMAnalyst:
         if max_candidates <= 0: raise ValueError("max_candidates must be positive")
         self.provider, self.repository, self.model_name = provider, repository, model_name
         self.prompt_version, self.max_candidates, self.clock = prompt_version, max_candidates, clock
-        self.api_calls = 0; self.api_analyses_completed = 0
+        self.api_calls = 0; self.api_analyses_completed = 0; self.cache_avoided_calls=0
 
-    def analyze(self, candidates: Sequence[LLMAnalysisInput]) -> list[LLMAnalysis]:
+    def analyze(self,candidates:Sequence[LLMAnalysisInput],*,event_driven:bool=False)->list[LLMAnalysis]:
         if len(candidates) > self.max_candidates:
             raise ValueError(f"candidate limit exceeded: {len(candidates)} > {self.max_candidates}")
-        return [self._analyze_one(candidate) for candidate in candidates]
+        return [self._analyze_one(candidate,event_driven=event_driven) for candidate in candidates]
 
-    def _analyze_one(self, candidate: LLMAnalysisInput) -> LLMAnalysis:
+    def _analyze_one(self,candidate:LLMAnalysisInput,*,event_driven:bool=False)->LLMAnalysis:
         self._validate_input(candidate)
         event_hashes = sorted({event.hash for event in candidate.events})
         market_hash = self._market_state_hash(candidate)
         input_hash = self._input_hash(candidate.symbol, event_hashes, market_hash)
         cached = self.repository.get(input_hash, self.model_name, self.prompt_version)
-        if cached is not None: return cached
+        if cached is not None:self.cache_avoided_calls+=1; return cached
+        if event_driven and event_hashes:
+            cached=self.repository.get_for_event_hashes(event_hashes,self.model_name,self.prompt_version)
+            if cached is not None:self.cache_avoided_calls+=1; return cached
         if not candidate.events:
             analysis = hold_analysis(candidate.symbol,"No relevant news/KAP event; LLM not required",confidence=0,
                                      status=LLMStatus.NOT_REQUIRED)
@@ -111,7 +117,9 @@ class LLMAnalyst:
     def _prompt_payload(candidate: LLMAnalysisInput) -> dict:
         return {"symbol":candidate.symbol,"technical":candidate.technical_signal.model_dump(mode="json"),
             "events":[{"id":event.id,"hash":event.hash,"source":event.source,"source_type":event.source_type.value,
-                       "title":event.title,"body":event.body,"published_at":event.published_at.isoformat()}
+                       "title":event.title,"body":event.body,"published_at":event.published_at.isoformat(),
+                       "event_type":event.event_type,"materiality":event.materiality_score,
+                       "source_reliability":event.source_reliability,"verification":event.verification}
                       for event in candidate.events],"portfolio_exposure_pct":candidate.portfolio_exposure_pct,
             "required_output_schema":LLMAnalysis.model_json_schema()}
 

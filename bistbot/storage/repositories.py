@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from bistbot.app.models import EventItem, LLMAnalysis, NewsItem, RankedEventCandidate, RiskDecision, TechnicalSignal, TradeSignal
+from bistbot.app.models import (EventItem, LLMAnalysis, MacroEvent, MacroLLMAnalysis, MarketRegimeState, NewsItem,
+    RankedEventCandidate, RiskDecision, TechnicalSignal, TradeSignal)
 from .database import Database
 
 
@@ -87,6 +88,14 @@ class LLMAnalysisRepository:
             (datetime.now().isoformat(),input_hash,market_state_hash,json.dumps(event_hashes),analysis.symbol,model_name,
              prompt_version,analysis.model_dump_json(),latency_ms,input_tokens,output_tokens,total_tokens,status))
 
+    def get_for_event_hashes(self,event_hashes:list[str],model_name:str,prompt_version:str)->LLMAnalysis|None:
+        target=sorted(event_hashes)
+        rows=self.database.query("SELECT event_hashes,output FROM llm_analysis_cache WHERE model_name=? AND prompt_version=? AND status!='PROVIDER_ERROR' ORDER BY created_at DESC",
+            (model_name,prompt_version))
+        for row in rows:
+            if sorted(json.loads(row["event_hashes"]))==target:return LLMAnalysis.model_validate_json(row["output"])
+        return None
+
 
 class RiskDecisionRepository:
     def __init__(self,database: Database): self.database=database
@@ -104,3 +113,32 @@ class SystemStateRepository:
         return rows[0]["value"] if rows else default
     def set(self,key: str,value: str) -> None:
         self.database.execute("INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
+
+
+class MarketRegimeRepository:
+    def __init__(self,database: Database): self.database=database
+    def event_changed(self,event: MacroEvent) -> bool:
+        rows=self.database.query("SELECT payload FROM macro_events WHERE canonical_event_id=?",(event.canonical_event_id,))
+        return not rows or rows[0]["payload"]!=event.model_dump_json()
+    def add_event(self,event: MacroEvent) -> bool:
+        changed=self.event_changed(event)
+        if changed:
+            self.database.execute("INSERT OR REPLACE INTO macro_events VALUES(?,?,?,?,?,?,?)",(
+                event.canonical_event_id,event.source_id,event.source,event.published_at.isoformat(),
+                event.fetched_at.isoformat(),event.materiality_score,event.model_dump_json()))
+        return changed
+    def has_event(self,canonical_event_id:str)->bool:
+        return bool(self.database.query("SELECT 1 FROM macro_events WHERE canonical_event_id=?",(canonical_event_id,)))
+    def add_state(self,state: MarketRegimeState) -> None:
+        self.database.execute("INSERT INTO market_regime_states(timestamp,regime,market_risk_score,confidence,payload) VALUES(?,?,?,?,?)",
+            (state.last_updated.isoformat(),state.regime.value,state.market_risk_score,state.confidence,state.model_dump_json()))
+    def latest(self) -> MarketRegimeState|None:
+        rows=self.database.query("SELECT payload FROM market_regime_states ORDER BY id DESC LIMIT 1")
+        return MarketRegimeState.model_validate_json(rows[0]["payload"]) if rows else None
+    def get_llm(self,signature: str,model_name: str) -> MacroLLMAnalysis|None:
+        rows=self.database.query("SELECT payload FROM macro_llm_cache WHERE event_signature=? AND model_name=?",(signature,model_name))
+        return MacroLLMAnalysis.model_validate_json(rows[0]["payload"]) if rows else None
+    def add_llm(self,signature: str,model_name: str,analysis: MacroLLMAnalysis) -> None:
+        from datetime import datetime,timezone
+        self.database.execute("INSERT OR REPLACE INTO macro_llm_cache VALUES(?,?,?,?)",
+            (signature,datetime.now(timezone.utc).isoformat(),model_name,analysis.model_dump_json()))

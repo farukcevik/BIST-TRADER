@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import yaml
+import certifi
 
 import bistbot.main as cli
 from bistbot.app.config import load_settings
@@ -104,6 +105,21 @@ def test_project_env_file_loads_key_without_printing_it(tmp_path,monkeypatch,cap
     assert cli.load_project_environment() is True
     assert cli.os.getenv("OPENAI_API_KEY")==secret
     assert secret not in capsys.readouterr().out
+
+
+def test_project_environment_configures_certifi_ca_bundle(monkeypatch,tmp_path):
+    monkeypatch.delenv("SSL_CERT_FILE",raising=False)
+    monkeypatch.setattr(cli,"PROJECT_ENV_FILE",tmp_path/"missing.env")
+    cli.load_project_environment()
+    assert cli.os.environ["SSL_CERT_FILE"]==certifi.where()
+
+
+def test_project_environment_preserves_explicit_ca_bundle(monkeypatch,tmp_path):
+    custom=str(tmp_path/"company-ca.pem")
+    monkeypatch.setenv("SSL_CERT_FILE",custom)
+    monkeypatch.setattr(cli,"PROJECT_ENV_FILE",tmp_path/"missing.env")
+    cli.load_project_environment()
+    assert cli.os.environ["SSL_CERT_FILE"]==custom
 
 
 def test_disabled_llm_stays_disabled_when_key_is_present(tmp_path,monkeypatch):

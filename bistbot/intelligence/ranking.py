@@ -11,6 +11,7 @@ from bistbot.app.models import EventItem, EventSourceType,IntelligenceStatus, Ra
 from bistbot.intelligence.kap_provider import KapProvider
 from bistbot.intelligence.news_provider import NewsProvider
 from bistbot.storage.repositories import EventRepository, IntelligenceRankingRepository
+from bistbot.intelligence.materiality import classify_events
 
 
 THEMES = (
@@ -21,15 +22,16 @@ THEMES = (
 MATERIALITY_HINTS = re.compile(r"\b(binding|signed|board approved|million|billion|mn|bn|try|tl|usd|eur|%|halted|suspended)\b", re.I)
 
 
-def event_hash(symbol: str, source: str, title: str, body: str) -> str:
-    normalized = " ".join(f"{symbol}|{source}|{title}|{body}".lower().split())
+def event_hash(symbol: str, source: str, title: str, body: str, published_at: datetime|None=None) -> str:
+    published=published_at.isoformat() if published_at else ""
+    normalized = " ".join(f"{symbol}|{source}|{title}|{body}|{published}".lower().split())
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def make_event(*, symbol: str, source: str, source_type: EventSourceType, title: str,
                published_at: datetime, fetched_at: datetime, body: str = "", url: str | None = None,
                trust_score: float, source_id: str | None = None) -> EventItem:
-    digest = event_hash(symbol, source, title, body)
+    digest = event_hash(symbol, source, title, body, published_at)
     return EventItem(id=source_id or digest[:24], symbol=symbol, source=source, source_type=source_type,
         title=title, body=body, url=url, published_at=published_at, fetched_at=fetched_at,
         hash=digest, trust_score=trust_score)
@@ -53,7 +55,7 @@ class EventRanker:
             events.extend(fetched); errors.extend(provider_errors)
         events = [event.model_copy(update={"trust_score": self.settings.kap_trust_score
                   if event.source_type is EventSourceType.KAP else self.settings.news_trust_score}) for event in events]
-        events = self._deduplicate(events, set(symbols))
+        events = classify_events(self._deduplicate(events, set(symbols)))
         if self.event_repository:
             for event in events: self.event_repository.add(event)
         by_symbol: dict[str, list[EventItem]] = {symbol:[] for symbol in symbols}
@@ -67,11 +69,12 @@ class EventRanker:
             combined = (candidate.overall_scanner_score if not any_events else
                         candidate.overall_scanner_score*self.settings.scanner_weight + event_score*self.settings.event_weight)
             reasons = ["external providers unavailable; scanner rank preserved"] if not any_events and errors else []
-            if symbol_events: reasons.append(f"{len(symbol_events)} unique event(s)")
+            material_events=[event for event in symbol_events if event.materiality_score>=self.settings.llm_materiality_threshold]
+            if symbol_events: reasons.append(f"{len(symbol_events)} unique event(s), {len(material_events)} material")
             ranked.append(RankedEventCandidate(symbol=candidate.symbol, scanner_score=candidate.overall_scanner_score,
                 event_score=round(event_score,4), combined_score=round(combined,4),
                 event_ids=[event.id for event in sorted(symbol_events,key=lambda item:item.published_at,reverse=True)], reasons=reasons,
-                intelligence_status=IntelligenceStatus.EVENTS_AVAILABLE if symbol_events else IntelligenceStatus.NO_NEWS))
+                intelligence_status=IntelligenceStatus.EVENTS_AVAILABLE if material_events else IntelligenceStatus.NO_NEWS))
         ranked.sort(key=lambda item:(-item.combined_score,item.symbol)); selected = ranked[:limit]
         if self.ranking_repository:
             cycle_id = uuid4().hex
@@ -94,9 +97,12 @@ class EventRanker:
         unique: dict[str, EventItem] = {}
         for event in events:
             if event.symbol not in candidates: continue
-            existing = unique.get(event.hash)
+            # The hash includes symbol, content and publication time, so aliases
+            # returned under multiple IDs collapse without merging later events.
+            key=event.hash or event.id
+            existing = unique.get(key)
             if existing is None or (event.trust_score,event.fetched_at) > (existing.trust_score,existing.fetched_at):
-                unique[event.hash] = event
+                unique[key] = event
         return sorted(unique.values(),key=lambda item:(item.symbol,item.hash))
 
     def _score_event(self, event: EventItem, symbol: str, now: datetime) -> float:
@@ -106,7 +112,7 @@ class EventRanker:
         relevance = min(100.0, 70 + text.count(symbol_token)*15)
         matches = sum(1 for theme in THEMES if theme in text)
         keywords = min(100.0, matches*35)
-        hints = len(MATERIALITY_HINTS.findall(text)); materiality = min(100.0, hints*30 + (20 if len(event.body)>300 else 0))
+        hints = len(MATERIALITY_HINTS.findall(text)); materiality = event.materiality_score
         w = self.settings.event_score_weights
         return min(100.0, recency*w.recency + event.trust_score*w.source_trust +
                    relevance*w.symbol_relevance + keywords*w.keywords + materiality*w.materiality)
