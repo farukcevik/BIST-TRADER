@@ -1,18 +1,35 @@
-# BISTBOT V1 architecture skeleton
+# BISTBOT V1
 
-Private, single-user, paper-only BIST trading application for Python 3.12+ and SQLite. It composes a deterministic demo market feed, scanner, resilient news/KAP ranking, evidence-bounded LLM analysis, configured final scoring, deterministic risk, and SQLite-backed paper execution. It intentionally contains no real broker connectivity.
+Private, single-user, paper-only BIST trading application for Python 3.12+ and SQLite. The runtime uses real market/intelligence providers when configured, evidence-bounded LLM analysis, deterministic risk, and SQLite-backed paper execution. It intentionally contains no real broker connectivity.
 
 ## Run
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 main.py --capital 200000
-python3 main.py --capital 200000 --once
-python3 main.py --status
-python3 -m pytest -q
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Long-running PAPER bot
+python main.py --capital 200000
+
+# One PAPER cycle / portfolio status
+python main.py --capital 200000 --once
+
+
+
+# Local read-only dashboard
+streamlit run dashboard.py
+
+# Tests
+pytest -q
 ```
 
-With no mode flag the process runs continuously at `schedule_seconds`. `--once` executes one complete cycle and exits. The default external news/KAP and LLM adapters fail safely to evidence-free HOLD, while deterministic demo market data keeps the pipeline testable without credentials. `PaperBroker` is the only usable broker. Instantiating `RealBroker` always raises `NotImplementedError`.
+With no mode flag the process runs continuously at `schedule_seconds`. `--once` executes one complete cycle and exits. External providers fail safely without turning missing evidence into negative sentiment. `PaperBroker` is the only usable broker. Instantiating `RealBroker` always raises `NotImplementedError`.
+
+## Local dashboard
+
+The Streamlit dashboard reads the existing `bistbot.db` in SQLite read-only/query-only mode and refreshes about every 30 seconds. Refreshing the page never starts a bot cycle, calls OpenAI, or places an order. It contains no BUY/SELL controls and always displays `MODE: PAPER`.
+
+Portfolio, positions, persisted performance snapshots, PAPER fills, recent cycle decisions, provider status, and configured risk limits are shown when those records exist. Per-symbol price history is not fabricated when it has not been persisted.
 
 ## Boundaries
 
@@ -24,3 +41,13 @@ With no mode flag the process runs continuously at `schedule_seconds`. `--once` 
 - `notifications`, `reporting`: output adapter contracts.
 
 Dependencies point inward toward `app.models`. Providers never execute orders. Strategy only proposes `TradeSignal`; risk returns `RiskDecision`; only an approved decision may be passed to `Broker` by a future application orchestrator.
+# Market regime overlay
+
+BISTBOT now keeps broad macro risk separate from company intelligence. `MacroNewsProvider`
+implementations feed official or licensed sources into a deterministic materiality gate. Only
+HIGH-materiality events are eligible for an optional LLM interpretation; unchanged events are
+cached by `canonical_event_id`.
+
+The resulting `RISK_ON`, `NORMAL`, `CAUTION`, `RISK_OFF`, or `CRISIS` state adjusts entry scores,
+buy thresholds and paper position sizing. Sector and market adjustments are reported separately.
+`CRISIS` blocks new entries, while the deterministic Risk Engine remains the final authority.
