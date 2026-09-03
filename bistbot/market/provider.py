@@ -14,9 +14,12 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from bistbot.app.models import Candle, MarketDataResult, MarketSnapshot, ProviderDiagnostics
+from bistbot.app.models import Candle,ExecutionQuote,MarketDataResult,MarketSnapshot,ProviderDiagnostics
+from bistbot.market.calendar import BistTradingCalendar
+from bistbot.market.execution_policy import validate_execution_quote
 
 
 class MarketDataProvider(Protocol):
@@ -24,6 +27,7 @@ class MarketDataProvider(Protocol):
     def historical(self, symbols: Sequence[str], *, bars: int = 60, interval: str = "1d") -> dict[str, MarketDataResult]: ...
     def intraday(self, symbols: Sequence[str], *, bars: int = 60, interval: str = "5m") -> dict[str, MarketDataResult]: ...
     def snapshots(self, symbols: Sequence[str]) -> dict[str, MarketDataResult]: ...
+    def latest_execution_quotes(self,symbols:Sequence[str],*,max_age:timedelta)->dict[str,ExecutionQuote]: ...
 
 
 class MarketDataTransport(Protocol):
@@ -71,6 +75,7 @@ class DemoTransport:
 
 class DemoMarketDataProvider:
     provider_mode = "MOCK"
+    provider_name = "DEMO"
     SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{1,11}(?:\.IS)?$")
 
     def __init__(self, transport: MarketDataTransport | None = None, *, timeout_seconds: float = 10,
@@ -95,6 +100,25 @@ class DemoMarketDataProvider:
 
     def snapshots(self, symbols: Sequence[str]) -> dict[str, MarketDataResult]:
         return self._fetch(symbols, 1, "1m", self.stale_after)
+
+    def latest_execution_quotes(self,symbols:Sequence[str],*,max_age:timedelta)->dict[str,ExecutionQuote]:
+        return self._execution_quotes(symbols,max_age=max_age,calendar=BistTradingCalendar(),
+            yahoo_freshness_seconds=max_age.total_seconds())
+
+    def _execution_quotes(self,symbols,*,max_age,calendar,yahoo_freshness_seconds):
+        fetched=_aware(self.now()); output={}
+        for symbol,result in self.snapshots(symbols).items():
+            if result.snapshot is None: continue
+            validation=validate_execution_quote(SimpleNamespace(provider=self.provider_name,
+                price=result.snapshot.price,source_timestamp=result.snapshot.timestamp),evaluated_at=fetched,
+                calendar=calendar,default_freshness_seconds=max_age.total_seconds(),
+                yahoo_freshness_seconds=yahoo_freshness_seconds)
+            if validation.price is None: continue
+            output[symbol]=ExecutionQuote(symbol=symbol,price=float(validation.price),source_timestamp=validation.source_timestamp,
+                fetched_at=fetched,provider=validation.provider,quote_age_seconds=validation.quote_age_seconds,
+                freshness_limit_seconds=validation.freshness_limit_seconds,session_date=validation.session_date,
+                freshness_status=validation.freshness_status)
+        return output
 
     def _fetch(self, symbols: Sequence[str], bars: int, interval: str,
                stale_after: timedelta) -> dict[str, MarketDataResult]:
@@ -272,8 +296,13 @@ class YahooChartTransport:
 
 class YahooBistProvider(DemoMarketDataProvider):
     provider_mode = "REAL"
-    def __init__(self,universe: BistSymbolUniverse|None=None,**kwargs):
+    provider_name = "YahooBistProvider"
+    def __init__(self,universe: BistSymbolUniverse|None=None,*,yahoo_execution_freshness_seconds:int,
+                 calendar:BistTradingCalendar|None=None,**kwargs):
         self.universe=universe or BistSymbolUniverse()
+        if yahoo_execution_freshness_seconds<=0: raise ValueError("yahoo execution freshness must be positive")
+        self.yahoo_execution_freshness_seconds=yahoo_execution_freshness_seconds
+        self.calendar=calendar or BistTradingCalendar()
         super().__init__(YahooChartTransport(),batch_size=kwargs.pop("batch_size",30),
                          requests_per_second=kwargs.pop("requests_per_second",2),**kwargs)
 
@@ -284,3 +313,6 @@ class YahooBistProvider(DemoMarketDataProvider):
     def symbols_configured(self) -> int: return self.universe.configured_count
     def intraday(self,symbols: Sequence[str],*,bars: int=60,interval: str="1h") -> dict[str,MarketDataResult]:
         return self._fetch(symbols,bars,interval,self.stale_after)
+    def latest_execution_quotes(self,symbols:Sequence[str],*,max_age:timedelta)->dict[str,ExecutionQuote]:
+        return self._execution_quotes(symbols,max_age=max_age,calendar=self.calendar,
+            yahoo_freshness_seconds=self.yahoo_execution_freshness_seconds)

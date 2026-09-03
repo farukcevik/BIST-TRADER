@@ -37,6 +37,7 @@ def approved(item,quantity):
 
 
 def buy_position(broker,*,timestamp=NOW,symbol="AAA",quantity=10):
+    broker.clock=lambda:timestamp
     item=signal(timestamp=timestamp,symbol=symbol); return broker.buy(item,approved(item,quantity))
 
 

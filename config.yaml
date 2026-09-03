@@ -82,3 +82,6 @@ llm:
   model: gpt-5-mini
   enabled: true
   timeout_seconds: 30
+
+market_data:
+  yahoo_execution_freshness_seconds: 1200

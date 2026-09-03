@@ -42,6 +42,9 @@ class LLMSettings(BaseModel):
 class DashboardSettings(BaseModel):
     live_price_refresh_seconds: int = Field(default=30,ge=10,le=3600)
 
+class MarketDataSettings(BaseModel):
+    yahoo_execution_freshness_seconds: int = Field(default=1200,gt=0)
+
 
 class RegimeBehavior(BaseModel):
     score_adjustment: float = 0
@@ -154,6 +157,7 @@ class Settings(BaseModel):
     intelligence: IntelligenceSettings
     llm: LLMSettings = Field(default_factory=LLMSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
+    market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     market_regime: MarketRegimeSettings = Field(default_factory=MarketRegimeSettings)
 
 
@@ -204,6 +208,7 @@ def _normalize_alternate_config(source: dict) -> dict:
         "execution":{"commission_pct":paper.get("commission_pct",.001),"slippage_pct":paper.get("slippage_pct",.0005)},
         "llm":source.get("llm",{}),
         "dashboard":source.get("dashboard",{}),
+        "market_data":source.get("market_data",{}),
         "market_regime":source.get("market_regime",{}),
         "scoring":{**{key:final_score.get(key,value) for key,value in {"technical":.3,"momentum":.2,"volume":.15,
             "news_kap":.2,"llm":.15}.items()},"buy_threshold":strategy.get("buy_threshold",65),

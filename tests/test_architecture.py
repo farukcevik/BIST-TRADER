@@ -43,6 +43,7 @@ def test_invalid_llm_response_is_hold():
 def test_paper_broker_accounting():
     broker = PaperBroker(10_000)
     buy = signal(Action.BUY)
+    broker.clock=lambda:buy.timestamp
     broker.buy(buy, RiskDecision(signal_id=buy.id,outcome=RiskOutcome.APPROVE,
         reason_code=RiskReasonCode.APPROVED,reason="test",approved_quantity=10))
     assert broker.cash() == 9_000

@@ -24,7 +24,7 @@ def approved(item,quantity=10):
 
 @pytest.mark.parametrize("when",[at(2026,8,29,12),at(2026,8,30,12)])
 def test_weekend_blocks_broker_buy_without_mutation(tmp_path,when):
-    db=Database(str(tmp_path/"paper.db")); broker=PaperBroker(10_000,database=db)
+    db=Database(str(tmp_path/"paper.db")); broker=PaperBroker(10_000,database=db,clock=lambda:when)
     item=signal(Action.BUY,when); cash=broker.get_cash()
     with pytest.raises(MarketClosedError,match="MARKET_CLOSED_WEEKEND"):
         broker.buy(item,approved(item))
@@ -54,11 +54,12 @@ def test_istanbul_timezone_conversion_is_authoritative():
 
 def test_closed_market_blocks_sell_and_all_price_exits(tmp_path):
     db=Database(str(tmp_path/"paper.db")); settings=load_settings("config.yaml")
-    broker=PaperBroker(10_000,database=db,risk_settings=settings.risk)
     friday=at(2026,8,28,12); buy=signal(Action.BUY,friday)
+    broker=PaperBroker(10_000,database=db,risk_settings=settings.risk,clock=lambda:friday)
     broker.buy(buy,approved(buy))
     cash=broker.get_cash(); position=broker.get_positions()["AAA"]
     saturday=at(2026,8,29,12); sell=signal(Action.SELL,saturday,90)
+    broker.clock=lambda:saturday
     with pytest.raises(MarketClosedError,match="MARKET_CLOSED_WEEKEND"):
         broker.sell(sell,10,approved(sell))
     for price in (Decimal("94"),Decimal("111")):
@@ -66,11 +67,13 @@ def test_closed_market_blocks_sell_and_all_price_exits(tmp_path):
     assert broker.get_cash()==cash and broker.get_positions()["AAA"]==position
 
 def test_closed_signal_is_not_persisted_or_automatically_replayed(tmp_path):
-    db=Database(str(tmp_path/"paper.db")); broker=PaperBroker(10_000,database=db)
+    db=Database(str(tmp_path/"paper.db")); broker=PaperBroker(10_000,database=db,
+        clock=lambda:at(2026,8,29,12))
     weekend=signal(Action.BUY,at(2026,8,29,12))
     with pytest.raises(MarketClosedError): broker.buy(weekend,approved(weekend))
     assert broker.get_orders()==[]
     monday=signal(Action.BUY,at(2026,8,31,11))
+    broker.clock=lambda:monday.timestamp
     broker.buy(monday,approved(monday))
     assert len(broker.get_orders())==1 and broker.get_orders()[0].signal_id==monday.id
 
@@ -78,7 +81,8 @@ def test_unsupported_calendar_year_fails_closed():
     assert BistTradingCalendar().status(at(2027,1,4,12)).reason=="MARKET_CALENDAR_UNAVAILABLE"
 
 def test_friday_close_is_not_an_executable_monday_open_price(tmp_path):
-    db=Database(str(tmp_path/"paper.db")); broker=PaperBroker(10_000,database=db)
+    db=Database(str(tmp_path/"paper.db")); broker=PaperBroker(10_000,database=db,
+        clock=lambda:at(2026,8,31,10,1))
     stale=signal(Action.BUY,at(2026,8,28,17,59))
     with pytest.raises(MarketClosedError,match="NO_FRESH_SESSION_PRICE"):
         broker.buy(stale,approved(stale),execution_time=at(2026,8,31,10,1))

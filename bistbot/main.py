@@ -294,7 +294,8 @@ def main() -> int:
             print(json.dumps(paper_status(database,settings),indent=2)); return 0
         notifier=SafeNotificationDispatcher([MacOSNotificationProvider(),TelegramNotificationProvider(),EmailNotificationProvider()])
         broker=PaperBroker(settings.capital,settings.execution.commission_pct,settings.execution.slippage_pct,
-                           database=database,risk_settings=settings.risk,notifier=notifier)
+                           database=database,risk_settings=settings.risk,notifier=notifier,
+                           yahoo_execution_freshness_seconds=settings.market_data.yahoo_execution_freshness_seconds)
         market_status=broker.calendar.status()
         print("\nBIST MARKET STATUS")
         print(f"local_time: {market_status.local_time.isoformat()}")

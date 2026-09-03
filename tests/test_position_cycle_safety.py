@@ -23,6 +23,7 @@ def approved(signal,quantity=10):
 
 
 def open_position(broker,symbol="AAA.IS",price=100):
+    broker.clock=lambda:NOW-timedelta(days=3)
     signal=TradeSignal(symbol=symbol,action=Action.BUY,score=75,reason="fixture",
         strategy_version="test",requested_price=price,timestamp=NOW-timedelta(days=3))
     broker.buy(signal,approved(signal)); return signal

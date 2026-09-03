@@ -113,9 +113,10 @@ def test_stage_contracts_support_one_paper_buy(tmp_path):
             settings.capital,
             settings.execution.commission_pct,
             settings.execution.slippage_pct,
-            database=database,
-            risk_settings=settings.risk,
-        ).buy(signal, decision)
+                database=database,
+                risk_settings=settings.risk,
+                clock=lambda:NOW,
+            ).buy(signal, decision)
         assert order.side is Action.BUY
         assert order.risk_decision == decision
         assert database.query("SELECT COUNT(*) AS count FROM paper_fills")[0]["count"] == 1

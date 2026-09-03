@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime,timedelta,timezone
 from decimal import Decimal,ROUND_HALF_UP
+from types import SimpleNamespace
 from uuid import uuid4
 
 from bistbot.app.config import RiskSettings
@@ -10,6 +12,7 @@ from bistbot.app.models import (Action,ExitReason,OrderStatus,PaperFill,PaperOrd
                                 RiskOutcome,RiskReasonCode,TradeSignal)
 from bistbot.notifications.base import SafeNotificationDispatcher
 from bistbot.market.calendar import BistTradingCalendar,MarketClosedError
+from bistbot.market.execution_policy import DEFAULT_EXECUTION_FRESHNESS_SECONDS,validate_execution_quote
 from bistbot.portfolio.service import PortfolioPosition,money
 from bistbot.portfolio.service import PortfolioState
 from bistbot.storage.database import Database
@@ -17,16 +20,22 @@ from bistbot.storage.repositories import RiskDecisionRepository,SystemStateRepos
 
 PRICE_STEP=Decimal("0.0001")
 
+def _aware_utc(value:datetime)->datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
 
 class PaperBroker:
     """The only V1 execution adapter. All state is virtual and SQLite-backed."""
     def __init__(self,starting_cash: Decimal|str|int|float=Decimal("200000"),commission_pct: float=0,
                  slippage_pct: float=0,*,database: Database|None=None,risk_settings: RiskSettings|None=None,
-                 notifier: SafeNotificationDispatcher|None=None,calendar: BistTradingCalendar|None=None):
+                 notifier: SafeNotificationDispatcher|None=None,calendar: BistTradingCalendar|None=None,
+                 yahoo_execution_freshness_seconds:int|None=None,clock:Callable[[],datetime]|None=None):
         self.database=database or Database(":memory:"); self.risk_settings=risk_settings
         self.commission_pct=Decimal(str(commission_pct)); self.slippage_pct=Decimal(str(slippage_pct))
         self.notifier=notifier or SafeNotificationDispatcher()
         self.calendar=calendar or BistTradingCalendar()
+        self.yahoo_execution_freshness_seconds=yahoo_execution_freshness_seconds
+        self.clock=clock or (lambda:datetime.now(timezone.utc))
         capital=money(starting_cash)
         if capital<=0 or self.commission_pct<0 or self.slippage_pct<0: raise ValueError("invalid paper broker configuration")
         self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_cash',?)",(str(capital),))
@@ -78,19 +87,21 @@ class PaperBroker:
                 (now.isoformat(),str(cash),str(equity),str(realized),str(unrealized)))
         return state
 
-    def buy(self,signal: TradeSignal,risk_decision: RiskDecision,*,execution_time: datetime|None=None) -> PaperOrder:
+    def buy(self,signal: TradeSignal,risk_decision: RiskDecision,*,execution_time: datetime|None=None,
+            execution_provider:str|None=None) -> PaperOrder:
         if signal.action is not Action.BUY: raise ValueError("buy requires BUY signal")
         if signal.symbol in self.get_positions(): raise ValueError("existing paper position; pyramiding disabled")
         if risk_decision.signal_id!=signal.id or not risk_decision.approved:
             self.notify_risk_rejection(signal.symbol,risk_decision); raise PermissionError("risk decision does not approve this signal")
-        self._guard_execution(signal.timestamp,execution_time or signal.timestamp)
+        self._guard_execution(signal.timestamp,signal.requested_price,execution_time or signal.timestamp,execution_provider)
         return self._fill(signal,risk_decision.approved_quantity,risk_decision)
 
-    def sell(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision,*,execution_time: datetime|None=None) -> PaperOrder:
+    def sell(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision,*,execution_time: datetime|None=None,
+             execution_provider:str|None=None) -> PaperOrder:
         if signal.action is not Action.SELL: raise ValueError("sell requires SELL signal")
         if (risk_decision.signal_id!=signal.id or not risk_decision.approved or
                 quantity>risk_decision.approved_quantity): raise PermissionError("sell is not approved")
-        self._guard_execution(signal.timestamp,execution_time or signal.timestamp)
+        self._guard_execution(signal.timestamp,signal.requested_price,execution_time or signal.timestamp,execution_provider)
         return self._fill(signal,quantity,risk_decision)
 
     def _fill(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision) -> PaperOrder:
@@ -153,7 +164,8 @@ class PaperBroker:
 
     def run_exit_checks(self,prices: dict[str,Decimal],*,price_timestamps: dict[str,datetime]|None=None,
                         strategy_exit_symbols: set[str]|None=None,
-                        now: datetime|None=None,strategy_version: str="v1",update_marks: bool=True) -> list[PaperOrder]:
+                        now: datetime|None=None,strategy_version: str="v1",update_marks: bool=True,
+                        execution_provider:str|None=None) -> list[PaperOrder]:
         """Must be invoked before each new-entry scan."""
         if self.risk_settings is None: raise RuntimeError("risk settings are required for exit checks")
         now=now or datetime.now(timezone.utc); strategy_exit_symbols=strategy_exit_symbols or set(); exits=[]
@@ -161,9 +173,9 @@ class PaperBroker:
         if not self.calendar.status(now).can_execute_orders:return exits
         for symbol,position in list(self.get_positions().items()):
             if symbol not in prices: continue
-            if not self.calendar.is_fresh_session_price(price_timestamps.get(symbol,now),now,
-                    timedelta(minutes=self.risk_settings.max_price_age_minutes)):continue
             price=Decimal(str(prices[symbol]))
+            validation=self._validation(price_timestamps.get(symbol),price,now,execution_provider)
+            if not validation.valid:continue
             if update_marks: high=self._update_high(symbol,price,now)
             else: high=Decimal(self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(symbol,))[0]["high_price"])
             reason=None
@@ -181,8 +193,10 @@ class PaperBroker:
                 state=self.get_portfolio_state({symbol:price},now=now)
                 from bistbot.app.models import RiskOrderRequest
                 decision=risk_engine.evaluate(RiskOrderRequest(signal_id=signal.id,symbol=symbol,action=Action.SELL,
-                    entry_price=price,price_timestamp=now,requested_quantity=position.quantity),state,now)
-                exits.append(self.sell(signal,position.quantity,decision,execution_time=now))
+                    entry_price=price,price_timestamp=signal.timestamp,execution_quote_validation=validation,
+                    requested_quantity=position.quantity),state,now)
+                exits.append(self.sell(signal,position.quantity,decision,execution_time=now,
+                    execution_provider=execution_provider))
         return exits
 
     def _update_high(self,symbol: str,price: Decimal,now: datetime) -> Decimal:
@@ -192,11 +206,20 @@ class PaperBroker:
                               (str(high),str(price),now.isoformat(),symbol))
         return high
 
-    def _guard_execution(self,price_timestamp:datetime,execution_time:datetime)->None:
-        self.calendar.require_executable(execution_time)
-        max_age=timedelta(minutes=self.risk_settings.max_price_age_minutes if self.risk_settings else 5)
-        if not self.calendar.is_fresh_session_price(price_timestamp,execution_time,max_age):
+    def _guard_execution(self,price_timestamp:datetime|None,price,execution_time:datetime,
+                         execution_provider:str|None)->None:
+        broker_now=_aware_utc(self.clock())
+        checked_at=max(broker_now,_aware_utc(execution_time))
+        validation=self._validation(price_timestamp,price,checked_at,execution_provider)
+        if not validation.valid:
+            if validation.reason.startswith("MARKET_CLOSED"): raise MarketClosedError(validation.reason)
             raise MarketClosedError("NO_FRESH_SESSION_PRICE")
+
+    def _validation(self,timestamp,price,now,provider):
+        default=(self.risk_settings.max_price_age_minutes*60 if self.risk_settings else DEFAULT_EXECUTION_FRESHNESS_SECONDS)
+        return validate_execution_quote(SimpleNamespace(provider=provider or "UNKNOWN",price=price,source_timestamp=timestamp),
+            evaluated_at=now,calendar=self.calendar,default_freshness_seconds=default,
+            yahoo_freshness_seconds=self.yahoo_execution_freshness_seconds or default)
 
     def cancel_order(self,order_id: str) -> bool:
         rows=self.database.query("SELECT payload FROM paper_orders WHERE id=? AND status='PENDING'",(order_id,))

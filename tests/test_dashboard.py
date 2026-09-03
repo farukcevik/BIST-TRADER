@@ -17,7 +17,7 @@ NOW=datetime(2026,8,24,12,tzinfo=timezone.utc)
 
 def test_dashboard_projects_paper_state_without_write_access(tmp_path):
     path=tmp_path/"dashboard.db"; settings=load_settings("config.v1.yaml"); database=Database(str(path))
-    broker=PaperBroker(10_000,database=database,risk_settings=settings.risk)
+    broker=PaperBroker(10_000,database=database,risk_settings=settings.risk,clock=lambda:NOW)
     signal=TradeSignal(symbol="GUBRF.IS",action=Action.BUY,score=75,reason="dashboard fixture",
         strategy_version="test",requested_price=100,timestamp=NOW)
     decision=RiskDecision(signal_id=signal.id,outcome=RiskOutcome.APPROVE,
@@ -55,7 +55,7 @@ def test_mixed_iso_timestamps_and_malformed_value_are_tolerated():
 
 def test_closed_trade_metrics_use_persisted_fills_and_activity_is_newest_first(tmp_path):
     path=tmp_path/"closed.db"; settings=load_settings("config.v1.yaml"); database=Database(str(path))
-    broker=PaperBroker(10_000,commission_pct=.001,database=database,risk_settings=settings.risk)
+    broker=PaperBroker(10_000,commission_pct=.001,database=database,risk_settings=settings.risk,clock=lambda:NOW)
     buy=TradeSignal(symbol="AAA.IS",action=Action.BUY,score=72,reason="ENTRY",strategy_version="test",
         requested_price=100,timestamp=NOW)
     buy_decision=RiskDecision(signal_id=buy.id,outcome=RiskOutcome.APPROVE,
@@ -78,7 +78,7 @@ def test_closed_trade_metrics_use_persisted_fills_and_activity_is_newest_first(t
 
 def test_total_net_pnl_is_equity_minus_capital_not_realized_plus_unrealized(tmp_path):
     path=tmp_path/"pnl.db"; settings=load_settings("config.v1.yaml"); database=Database(str(path))
-    broker=PaperBroker(10_000,database=database,risk_settings=settings.risk)
+    broker=PaperBroker(10_000,database=database,risk_settings=settings.risk,clock=lambda:NOW)
     signal=TradeSignal(symbol="AAA.IS",action=Action.BUY,score=75,reason="ENTRY",strategy_version="test",
         requested_price=100,timestamp=NOW)
     decision=RiskDecision(signal_id=signal.id,outcome=RiskOutcome.APPROVE,

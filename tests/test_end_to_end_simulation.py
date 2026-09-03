@@ -217,9 +217,10 @@ def test_offline_full_pipeline_523_to_paper_fill_and_stop_exit(tmp_path):
             settings.execution.commission_pct,
             settings.execution.slippage_pct,
             database=database,
-            risk_settings=settings.risk,
-            notifier=SafeNotificationDispatcher([recorder]),
-        )
+                risk_settings=settings.risk,
+                notifier=SafeNotificationDispatcher([recorder]),
+                clock=lambda:NOW,
+            )
         order = broker.buy(trade_signal, risk_decision)
         assert order.side is Action.BUY
         assert broker.get_positions()[selected.symbol].quantity == 10

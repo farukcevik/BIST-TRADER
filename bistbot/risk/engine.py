@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime,timedelta,timezone
+from datetime import datetime,timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 from bistbot.app.config import RiskSettings
 from bistbot.app.models import Action,RiskDecision,RiskOrderRequest,RiskOutcome,RiskReasonCode
 from bistbot.portfolio.service import PortfolioState
+from bistbot.market.calendar import BistTradingCalendar
+from bistbot.market.execution_policy import validate_execution_quote
 from bistbot.storage.repositories import RiskDecisionRepository,SystemStateRepository
 from .position_sizing import DeterministicPositionSizer
 
@@ -30,10 +33,14 @@ class DeterministicRiskEngine:
             return self._save(request,RiskOutcome.REJECT,RiskReasonCode.INVALID_REQUEST,"Risk entry validation accepts BUY proposals only")
         if request.action is Action.BUY and self.kill_switch.active:
             return self._save(request,RiskOutcome.HALT_TRADING,RiskReasonCode.KILL_SWITCH,"Global kill switch is active")
-        timestamp=request.price_timestamp if request.price_timestamp.tzinfo else request.price_timestamp.replace(tzinfo=timezone.utc)
-        reference=now if now.tzinfo else now.replace(tzinfo=timezone.utc)
-        if (reference-timestamp).total_seconds()<0 or reference-timestamp > timedelta(minutes=self.settings.max_price_age_minutes):
-            return self._save(request,RiskOutcome.REJECT,RiskReasonCode.STALE_PRICE,"Price is stale or future-dated")
+        validation=request.execution_quote_validation or validate_execution_quote(SimpleNamespace(provider="UNKNOWN",
+            price=request.entry_price,source_timestamp=request.price_timestamp),evaluated_at=now,calendar=BistTradingCalendar(),
+            default_freshness_seconds=self.settings.max_price_age_minutes*60,
+            yahoo_freshness_seconds=self.settings.max_price_age_minutes*60)
+        if (not validation.valid or validation.source_timestamp is None or validation.price!=request.entry_price or
+                validation.source_timestamp!=request.price_timestamp):
+            return self._save(request,RiskOutcome.REJECT,RiskReasonCode.STALE_PRICE,
+                f"Execution quote validation failed: {validation.reason}")
         if request.action is Action.SELL:
             position=portfolio.positions.get(request.symbol)
             if position is None:

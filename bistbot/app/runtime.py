@@ -14,6 +14,7 @@ from bistbot.intelligence.news_provider import YahooFinanceNewsProvider,NewsProv
 from bistbot.intelligence.ranking import EventRanker
 from bistbot.intelligence.materiality import classify_events
 from bistbot.market.provider import MarketDataProvider,YahooBistProvider
+from bistbot.market.execution_policy import validate_execution_quote
 from bistbot.market.scanner import DeterministicMarketScanner
 from bistbot.market_regime.engine import MarketRegimeEngine,apply_market_overlay
 from bistbot.market_regime.llm import MacroLLMAnalyst
@@ -42,7 +43,9 @@ class BistBotApplication:
                  llm_provider: LLMProvider|None=None,llm_model: str="disabled-v1",
                  macro_provider: MacroNewsProvider|None=None):
         self.settings,self.database,self.broker,self.notifier=settings,database,broker,notifier
-        self.market=market or YahooBistProvider(); self.news=news or YahooFinanceNewsProvider(); self.kap=kap or RealKapProvider()
+        self.market=market or YahooBistProvider(yahoo_execution_freshness_seconds=
+            settings.market_data.yahoo_execution_freshness_seconds)
+        self.news=news or YahooFinanceNewsProvider(); self.kap=kap or RealKapProvider()
         self.llm_provider=llm_provider or DisabledLLMProvider()
         self.event_repository=EventRepository(database)
         self.scanner=DeterministicMarketScanner(settings.scanner,TechnicalSignalRepository(database))
@@ -234,7 +237,8 @@ class BistBotApplication:
                          ("STRATEGY_EXIT" if symbol in strategy_exit_symbols else "HOLD / CHECK PRICE EXITS")})
         if exit_prices and not dry_run:
             exit_orders=self.broker.run_exit_checks(exit_prices,price_timestamps=exit_price_timestamps,strategy_exit_symbols=strategy_exit_symbols,
-                now=now,strategy_version=self.settings.strategy_version,update_marks=False)
+                now=now,strategy_version=self.settings.strategy_version,update_marks=False,
+                execution_provider=getattr(self.market,"provider_name",None))
         exited={order.symbol:order.reason for order in exit_orders}
         for detail in position_diagnostics:
             if detail["symbol"] in exited: detail["action"]=f"PAPER SELL — {exited[detail['symbol']]}"
@@ -291,17 +295,28 @@ class BistBotApplication:
             if strategy_decision.action is Action.HOLD: continue
             if not market_status.can_execute_orders:
                 detail["execution"]="BLOCKED"; detail["execution_reason"]=market_status.reason
+                detail["decision"]=Action.HOLD.value; detail["reason"]=market_status.reason; continue
             if strategy_decision.action is Action.BUY and stale_position_symbols:
                 detail["decision"]=Action.HOLD.value
                 detail["reason"]=("new entries blocked: stale market data for open position(s): "+
                                   ", ".join(sorted(stale_position_symbols)))
                 continue
-            price_timestamp=candidate.technical_signal.timestamp
-            if market_status.can_execute_orders and not self.broker.calendar.is_fresh_session_price(
-                    price_timestamp,now,timedelta(minutes=self.settings.risk.max_price_age_minutes)):
+            try:
+                quote=self.market.latest_execution_quotes([candidate.symbol],
+                    max_age=timedelta(minutes=self.settings.risk.max_price_age_minutes)).get(candidate.symbol)
+            except Exception: quote=None
+            execution_time=quote.fetched_at if quote else now
+            validation=(validate_execution_quote(quote,evaluated_at=execution_time,calendar=self.broker.calendar,
+                default_freshness_seconds=self.settings.risk.max_price_age_minutes*60,
+                yahoo_freshness_seconds=self.settings.market_data.yahoo_execution_freshness_seconds) if quote else None)
+            detail.update({"execution_provider":validation.provider if validation else getattr(self.market,"provider_name","UNKNOWN"),
+                "execution_quote_age_seconds":validation.quote_age_seconds if validation else None,
+                "execution_freshness_limit_seconds":validation.freshness_limit_seconds if validation else self.settings.risk.max_price_age_minutes*60,
+                "execution_freshness_status":validation.freshness_status.value if validation else "NO_TIMESTAMP"})
+            if validation is None or not validation.valid:
                 detail["execution"]="BLOCKED"; detail["execution_reason"]="NO_FRESH_SESSION_PRICE"
                 detail["decision"]=Action.HOLD.value; detail["reason"]="NO_FRESH_SESSION_PRICE"; continue
-            price=Decimal(str(market_results[candidate.symbol].snapshot.price))
+            price_timestamp=validation.source_timestamp; price=validation.price
             signal=TradeSignal(timestamp=price_timestamp,symbol=candidate.symbol,action=strategy_decision.action,
                 score=strategy_decision.final_score,reason=strategy_decision.reason,
                 strategy_version=self.settings.strategy_version,requested_price=float(price))
@@ -314,9 +329,10 @@ class BistBotApplication:
                 continue
             request=RiskOrderRequest(signal_id=signal.id,symbol=signal.symbol,action=signal.action,
                 entry_price=price,stop_price=(price*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))
-                if signal.action is Action.BUY else None),price_timestamp=processing_time,
+                if signal.action is Action.BUY else None),price_timestamp=price_timestamp,
+                execution_quote_validation=validation,
                 requested_quantity=position.quantity if signal.action is Action.SELL and position else None)
-            risk_decision=self.risk.evaluate(request,state,processing_time)
+            risk_decision=self.risk.evaluate(request,state,execution_time)
             if signal.action is Action.BUY and risk_decision.approved and overlay.position_multiplier<1:
                 scaled=int(risk_decision.approved_quantity*overlay.position_multiplier)
                 if scaled>0:
@@ -333,8 +349,10 @@ class BistBotApplication:
                 detail["reason"]=f"RiskEngine rejected: {risk_decision.reason_code.value}"
                 self.broker.notify_risk_rejection(signal.symbol,risk_decision); continue
             if dry_run or not market_status.can_execute_orders: continue
-            if signal.action is Action.BUY: entry_orders.append(self.broker.buy(signal,risk_decision,execution_time=now))
-            elif position: entry_orders.append(self.broker.sell(signal,risk_decision.approved_quantity,risk_decision,execution_time=now))
+            if signal.action is Action.BUY: entry_orders.append(self.broker.buy(signal,risk_decision,
+                execution_time=execution_time,execution_provider=validation.provider))
+            elif position: entry_orders.append(self.broker.sell(signal,risk_decision.approved_quantity,risk_decision,
+                execution_time=execution_time,execution_provider=validation.provider))
         state=self.broker.get_portfolio_state(now=processing_time,persist=not dry_run)
         distributions=_score_distributions(self.scanner.last_signals)
         self.last_diagnostics={"positions":position_diagnostics,

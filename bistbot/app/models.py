@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date,datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal
@@ -29,6 +29,36 @@ class MarketSnapshot(BaseModel):
     volume: float = Field(ge=0)
     fields: dict[str, float] = Field(default_factory=dict)
     is_stale: bool = False
+
+class QuoteFreshnessStatus(StrEnum):
+    FRESH="FRESH"
+    CURRENT_SESSION_DELAYED_ACCEPTED="CURRENT_SESSION_DELAYED_ACCEPTED"
+    STALE_CURRENT_SESSION="STALE_CURRENT_SESSION"
+    PREVIOUS_SESSION="PREVIOUS_SESSION"
+    NO_TIMESTAMP="NO_TIMESTAMP"
+
+class ExecutionQuote(BaseModel):
+    symbol: str
+    price: float = Field(gt=0)
+    source_timestamp: datetime|None
+    fetched_at: datetime
+    provider: str
+    quote_age_seconds: float|None = Field(default=None,ge=0)
+    freshness_limit_seconds: float = Field(gt=0)
+    session_date: date|None = None
+    freshness_status: QuoteFreshnessStatus
+
+class ExecutionQuoteValidation(BaseModel):
+    valid: bool
+    provider: str
+    price: Decimal|None = None
+    source_timestamp: datetime|None
+    evaluated_at: datetime
+    session_date: date|None = None
+    quote_age_seconds: float|None = Field(default=None,ge=0)
+    freshness_limit_seconds: float = Field(gt=0)
+    freshness_status: QuoteFreshnessStatus
+    reason: str
 
 
 class Candle(BaseModel):
@@ -343,6 +373,7 @@ class RiskOrderRequest(BaseModel):
     entry_price: Decimal = Field(gt=0)
     stop_price: Decimal | None = Field(default=None, gt=0)
     price_timestamp: datetime
+    execution_quote_validation: ExecutionQuoteValidation|None = None
     requested_quantity: int | None = Field(default=None, gt=0)
 
 
