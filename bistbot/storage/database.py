@@ -23,6 +23,15 @@ class Database:
         for name,declaration in additions.items():
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE paper_positions ADD COLUMN {name} {declaration}")
+        plan_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(entry_plans)")}
+        plan_additions={"original_quantity":"INTEGER NOT NULL DEFAULT 0",
+                        "target_1_quantity":"INTEGER NOT NULL DEFAULT 0",
+                        "target_2_quantity":"INTEGER NOT NULL DEFAULT 0",
+                        "target_3_quantity":"INTEGER NOT NULL DEFAULT 0",
+                        "plan_mode":"TEXT NOT NULL DEFAULT 'DYNAMIC'"}
+        for name,declaration in plan_additions.items():
+            if name not in plan_columns:
+                self.connection.execute(f"ALTER TABLE entry_plans ADD COLUMN {name} {declaration}")
         self.connection.commit()
 
     def execute(self, sql: str, parameters: Iterable[Any] = ()) -> sqlite3.Cursor:

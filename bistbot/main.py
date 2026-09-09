@@ -216,11 +216,14 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
             print(f"missing components: {breakdown.get('missing_components')}")
             print(f"raw weighted sum: {breakdown.get('raw_weighted_sum')}")
             print(f"final score: {breakdown.get('final_score')}")
+        plan=item.get("entry_plan") or item.get("potential_plan")
+        if plan is not None:
+            _print_dynamic_entry_plan(item,plan)
     holds=[item for item in diagnostics.get("candidates",[]) if item["decision"]=="HOLD"]
     print("\nHOLD REASON")
     if not holds: print("none")
     for item in holds:
-        print(f"\n{item['symbol']}\nfinal_score: {item['final_score']}\ndecision: HOLD\nreason: {item['reason']}")
+        print(f"\n{item['symbol']}\nfinal_score: {item.get('final_score')}\ndecision: HOLD\nreason: {item.get('reason')}")
     print("\nRISK DECISION")
     risks=diagnostics.get("risk",[])
     if not risks: print("none (no executable BUY/SELL signal)")
@@ -230,6 +233,37 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
               f"\nmaximum_allowed_risk: {item['maximum_allowed_risk']}\nrisk_decision: {item['risk_decision']}"
               f"\nreason_code: {item['reason_code']}\nreason: {item['reason']}")
     print()
+
+
+def _print_dynamic_entry_plan(candidate: dict,plan) -> None:
+    """Present deterministic plan diagnostics without making execution decisions."""
+    if hasattr(plan,"model_dump"): plan=plan.model_dump(mode="json")
+    elif not isinstance(plan,dict): plan=dict(plan)
+    components=plan.get("target_components") or plan.get("target_components_json") or {}
+    if isinstance(components,str):
+        try: components=json.loads(components)
+        except (TypeError,ValueError): components={}
+    print("DYNAMIC ENTRY PLAN")
+    fields=(("symbol",candidate.get("symbol")),("entry",plan.get("entry_price")),
+        ("stop",plan.get("initial_stop_price") or plan.get("current_stop_price")),
+        ("stop_distance_pct",_percentage_points(plan.get("downside_risk_pct"))),("target_1",plan.get("target_1")),
+        ("target_2",plan.get("target_2")),("target_3",plan.get("target_3")),
+        ("expected_upside_pct",_percentage_points(plan.get("expected_upside_pct"))),("potential_score",plan.get("potential_score")),
+        ("risk_reward_ratio",plan.get("risk_reward_ratio")),("holding_horizon",plan.get("holding_horizon")),
+        ("target_confidence",plan.get("target_confidence")),("target_method",plan.get("target_method")))
+    for label,value in fields: print(f"{label}: {value}")
+    print("TARGET COMPONENTS")
+    for key in ("resistance_target","swing_high_target","atr_target","trend_extension_target"):
+        print(f"{key}: {components.get(key)}")
+    print(f"catalyst_adjustment: {components.get('catalyst_adjustment',components.get('catalyst_adjustment_pct'))}")
+    decision=candidate.get("decision") or plan.get("decision") or "HOLD"
+    print(f"DECISION:\n{decision}")
+    if decision=="HOLD": print(f"reason: {candidate.get('reason') or plan.get('reason')}")
+
+
+def _percentage_points(value):
+    try:return None if value is None else round(float(value)*100,4)
+    except (TypeError,ValueError):return value
 
 
 def print_cycle_action_summary(summary: dict,diagnostics: dict) -> None:

@@ -48,6 +48,21 @@ def test_verbose_formatter_prints_scores_hold_reason_and_risk(capsys):
     assert "RISK DECISION" in output and "reason_code: MAX_POSITION_SIZE" in output
 
 
+def test_verbose_formatter_prints_dynamic_entry_plan_and_explicit_rr_rejection(capsys):
+    diagnostics={"candidates":[{"symbol":"AAA","scanner_score":80,"decision":"HOLD",
+        "reason":"INSUFFICIENT_RISK_REWARD","news_status":"NO_NEWS","llm_status":"NOT_REQUIRED",
+        "signal_mode":"TECHNICAL_ONLY","entry_plan":{"entry_price":"100","initial_stop_price":"95",
+            "target_1":"103","target_2":"106","target_3":"109","expected_upside_pct":6,
+            "downside_risk_pct":5,"risk_reward_ratio":1.2,"potential_score":58,"holding_horizon":"SHORT_SWING",
+            "target_confidence":"MEDIUM","target_method":"STRUCTURE_ATR","target_components":{
+                "resistance_target":"106","swing_high_target":"109","atr_target":"105",
+                "trend_extension_target":"107","catalyst_adjustment":0}}}]}
+    cli.print_verbose_diagnostics(diagnostics); output=capsys.readouterr().out
+    assert "DYNAMIC ENTRY PLAN" in output and "target_3: 109" in output
+    assert "TARGET COMPONENTS" in output and "resistance_target: 106" in output
+    assert "DECISION:\nHOLD\nreason: INSUFFICIENT_RISK_REWARD" in output
+
+
 def test_cycle_summary_explains_raw_buy_blocked_by_existing_position(capsys):
     diagnostics={"candidates":[{"symbol":"GUBRF.IS","final_score":72.509,"strategy_decision":"BUY",
         "decision":"HOLD","reason":"existing paper position; pyramiding disabled"}]}

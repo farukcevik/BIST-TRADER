@@ -58,3 +58,22 @@ scoring:
   llm: 0.15
   buy_threshold: 65
   sell_threshold: 35
+strategy:
+  minimum_risk_reward_ratio: 1.5
+potential:
+  enabled: true
+  atr_target_min_multiplier: 1.5
+  atr_target_max_multiplier: 3.0
+  catalyst_adjustment_max_pct: 0.015
+  stop_min_pct: 0.03
+  stop_max_pct: 0.08
+  target_revaluation_enabled: true
+  # Material triggers only; target changes are capped at +8%/-10% per revision.
+  revaluation_swing_atr_threshold: 0.5
+  revaluation_volatility_change_pct: 0.25
+  revaluation_trend_drop_points: 15
+  target_revision_max_up_pct: 0.08
+  target_revision_max_down_pct: 0.10
+exit:
+  dynamic_targets_enabled: true
+  partial_targets: {target_1_fraction: 0.25, target_2_fraction: 0.25, target_3_fraction: 0.50}

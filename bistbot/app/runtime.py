@@ -6,7 +6,7 @@ import json
 import logging
 
 from bistbot.app.config import Settings
-from bistbot.app.models import Action,LLMAnalysisInput,RiskOrderRequest,TradeSignal
+from bistbot.app.models import Action,EntryPlan,LLMAnalysisInput,RiskOrderRequest,TradeSignal
 from bistbot.broker.paper import PaperBroker
 from bistbot.intelligence.kap_provider import RealKapProvider,KapProvider
 from bistbot.intelligence.llm_provider import LLMAnalyst,LLMCompletion,LLMProvider
@@ -25,6 +25,7 @@ from bistbot.storage.database import Database
 from bistbot.storage.repositories import (EventRepository,IntelligenceRankingRepository,LLMAnalysisRepository,
     MarketRegimeRepository,RiskDecisionRepository,SystemStateRepository,TechnicalSignalRepository)
 from bistbot.strategy.engine import DeterministicStrategyEngine
+from bistbot.strategy.potential import PotentialEngine,PotentialInput
 
 
 class DisabledLLMProvider:
@@ -43,6 +44,7 @@ class BistBotApplication:
                  llm_provider: LLMProvider|None=None,llm_model: str="disabled-v1",
                  macro_provider: MacroNewsProvider|None=None):
         self.settings,self.database,self.broker,self.notifier=settings,database,broker,notifier
+        self.broker.exit_settings=settings.exit
         self.market=market or YahooBistProvider(yahoo_execution_freshness_seconds=
             settings.market_data.yahoo_execution_freshness_seconds)
         self.news=news or YahooFinanceNewsProvider(); self.kap=kap or RealKapProvider()
@@ -54,6 +56,7 @@ class BistBotApplication:
         self.analyst=LLMAnalyst(self.llm_provider,LLMAnalysisRepository(database),
             model_name=llm_model,max_candidates=settings.analysis_top_n)
         self.strategy=DeterministicStrategyEngine(settings.scoring)
+        self.potential=PotentialEngine(settings.potential)
         self.macro_provider=macro_provider or RealMacroNewsProvider()
         self.market_regime=MarketRegimeEngine(settings.market_regime,self.macro_provider)
         self.market_regime_repository=MarketRegimeRepository(database)
@@ -262,6 +265,24 @@ class BistBotApplication:
             "historical_comparable_volume":item.metrics.get("historical_comparable_volume")} for rank,item in enumerate(top_40,1)]
         top_10=self.ranker.rank(top_40,limit=self.settings.analysis_top_n,now=processing_time)
         technical={item.symbol:item for item in top_40}
+        if self.settings.potential.target_revaluation_enabled:
+            for symbol,plan_row in self.broker.get_entry_plans().items():
+                signal_for_plan=technical.get(symbol)
+                if plan_row.get("plan_mode")!="DYNAMIC" or signal_for_plan is None: continue
+                if signal_for_plan.timestamp<=datetime.fromisoformat(plan_row["updated_at"]): continue
+                try:
+                    existing=EntryPlan.model_validate({key:value for key,value in plan_row.items()
+                        if key in EntryPlan.model_fields})
+                    evidence=PotentialInput(technical=signal_for_plan,bars=histories[symbol],
+                        decision_timestamp=signal_for_plan.timestamp,market_regime=regime.regime,
+                        sector_adjustment=self.market_regime.overlay(symbol,regime).sector_adjustment)
+                    trigger=self.potential.revaluation_trigger(existing,evidence)
+                    if trigger=="TARGET_REACHED" and plan_row.get("exit_stage")!="INITIAL": trigger=None
+                    if trigger:
+                        revised=self.potential.re_evaluate(existing,evidence,trigger)
+                        self.broker.revise_entry_plan(symbol,revised,trigger,signal_for_plan.timestamp)
+                except (ValueError,ArithmeticError,KeyError):
+                    logger.warning("entry plan revaluation skipped",extra={"symbol":symbol})
         inputs=[LLMAnalysisInput(symbol=item.symbol,technical_signal=technical[item.symbol],
                     events=[event for event in classify_events(self.event_repository.get_by_ids(item.event_ids))
                             if event.materiality_score>=self.settings.intelligence.llm_materiality_threshold],
@@ -274,6 +295,21 @@ class BistBotApplication:
                 self.strategy.evaluate(candidate.technical_signal,ranking[candidate.symbol],analysis),overlay,
                 self.settings.scoring.buy_threshold)
             decisions.append(strategy_decision)
+            entry_plan=None; entry_plan_error=None
+            if (strategy_decision.action is Action.BUY and self.settings.potential.enabled and
+                    self.settings.exit.dynamic_targets_enabled):
+                try:
+                    entry_plan=self.potential.evaluate(PotentialInput(technical=candidate.technical_signal,
+                        bars=histories[candidate.symbol],decision_timestamp=candidate.technical_signal.timestamp,
+                        market_regime=regime.regime,sector_adjustment=overlay.sector_adjustment,
+                        catalyst_score=analysis.catalyst_score,catalyst_confidence=analysis.confidence))
+                except (ValueError,ArithmeticError) as error:
+                    entry_plan_error=f"POTENTIAL_PLAN_UNAVAILABLE: {type(error).__name__}"
+                    strategy_decision=strategy_decision.model_copy(update={"action":Action.HOLD,
+                        "reason":"POTENTIAL_PLAN_UNAVAILABLE"})
+                if entry_plan is not None and entry_plan.risk_reward_ratio<self.settings.strategy.minimum_risk_reward_ratio:
+                    strategy_decision=strategy_decision.model_copy(update={"action":Action.HOLD,
+                        "reason":"INSUFFICIENT_RISK_REWARD"})
             detail={"symbol":candidate.symbol,"scanner_score":candidate.technical_signal.overall_scanner_score,
                 "news_kap_score":ranking[candidate.symbol].event_score,"sentiment":analysis.sentiment,
                 "importance":analysis.importance,"catalyst_score":analysis.catalyst_score,
@@ -284,6 +320,8 @@ class BistBotApplication:
                 "final_score":strategy_decision.final_score,"decision":strategy_decision.action.value,
                 "strategy_decision":strategy_decision.action.value,"reason":strategy_decision.reason,
                 "signal_mode":strategy_decision.signal_mode.value}
+            detail["entry_plan"]=(entry_plan.model_dump(mode="json") if entry_plan else None)
+            detail["entry_plan_error"]=entry_plan_error
             detail.update({"base_stock_score":strategy_decision.score_breakdown["base_stock_score"],
                 "market_regime":regime.regime.value,"market_adjustment":overlay.market_adjustment,
                 "sector_adjustment":overlay.sector_adjustment,
@@ -327,8 +365,22 @@ class BistBotApplication:
                 detail["decision"]=Action.HOLD.value
                 detail["reason"]="existing paper position; pyramiding disabled"
                 continue
+            effective_plan=entry_plan
+            if signal.action is Action.BUY and entry_plan is not None:
+                modeled_entry=self.broker._model_fill(signal)
+                stop=Decimal(str(entry_plan.initial_stop_price))
+                first_target=Decimal(str(entry_plan.target_1)); target=Decimal(str(entry_plan.target_2))
+                downside=(modeled_entry-stop)/modeled_entry; upside=(target-modeled_entry)/modeled_entry
+                if (stop>=modeled_entry or first_target<=modeled_entry or downside<=0 or
+                        upside/downside<Decimal(str(self.settings.strategy.minimum_risk_reward_ratio))):
+                    detail["decision"]=Action.HOLD.value; detail["reason"]="INSUFFICIENT_RISK_REWARD"; continue
+                effective_plan=entry_plan.model_copy(update={"entry_price":float(modeled_entry),
+                    "downside_risk_pct":float(downside),"expected_upside_pct":float(upside),
+                    "risk_reward_ratio":float(upside/downside)})
+                detail["entry_plan"]=effective_plan.model_dump(mode="json")
             request=RiskOrderRequest(signal_id=signal.id,symbol=signal.symbol,action=signal.action,
-                entry_price=price,stop_price=(price*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))
+                entry_price=price,stop_price=(Decimal(str(effective_plan.initial_stop_price)) if effective_plan is not None else
+                price*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))
                 if signal.action is Action.BUY else None),price_timestamp=price_timestamp,
                 execution_quote_validation=validation,
                 requested_quantity=position.quantity if signal.action is Action.SELL and position else None)
@@ -350,7 +402,7 @@ class BistBotApplication:
                 self.broker.notify_risk_rejection(signal.symbol,risk_decision); continue
             if dry_run or not market_status.can_execute_orders: continue
             if signal.action is Action.BUY: entry_orders.append(self.broker.buy(signal,risk_decision,
-                execution_time=execution_time,execution_provider=validation.provider))
+                execution_time=execution_time,execution_provider=validation.provider,entry_plan=effective_plan))
             elif position: entry_orders.append(self.broker.sell(signal,risk_decision.approved_quantity,risk_decision,
                 execution_time=execution_time,execution_provider=validation.provider))
         state=self.broker.get_portfolio_state(now=processing_time,persist=not dry_run)

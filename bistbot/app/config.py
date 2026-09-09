@@ -85,6 +85,50 @@ class ScoringSettings(BaseModel):
         return self
 
 
+class StrategySettings(BaseModel):
+    minimum_risk_reward_ratio: float = Field(default=1.5, gt=0)
+
+
+class PotentialSettings(BaseModel):
+    enabled: bool = True
+    atr_target_min_multiplier: float = Field(default=1.5, gt=0)
+    atr_target_max_multiplier: float = Field(default=3.0, gt=0)
+    catalyst_adjustment_max_pct: float = Field(default=0.015, ge=0, le=0.02)
+    stop_min_pct: float = Field(default=0.03, gt=0, lt=1)
+    stop_max_pct: float = Field(default=0.08, gt=0, lt=1)
+    target_revaluation_enabled: bool = True
+    revaluation_swing_atr_threshold: float = Field(default=0.5, gt=0)
+    revaluation_volatility_change_pct: float = Field(default=0.25, gt=0, le=1)
+    revaluation_trend_drop_points: float = Field(default=15, gt=0, le=100)
+    target_revision_max_up_pct: float = Field(default=0.08, ge=0, le=0.15)
+    target_revision_max_down_pct: float = Field(default=0.10, ge=0, le=0.25)
+
+    @model_validator(mode="after")
+    def ordered_bounds(self) -> "PotentialSettings":
+        if self.atr_target_min_multiplier > self.atr_target_max_multiplier:
+            raise ValueError("ATR target minimum must not exceed maximum")
+        if self.stop_min_pct > self.stop_max_pct:
+            raise ValueError("stop minimum must not exceed maximum")
+        return self
+
+
+class PartialTargetSettings(BaseModel):
+    target_1_fraction: float = Field(default=0.25, ge=0, le=1)
+    target_2_fraction: float = Field(default=0.25, ge=0, le=1)
+    target_3_fraction: float = Field(default=0.50, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def fractions_sum_to_one(self) -> "PartialTargetSettings":
+        if abs(self.target_1_fraction + self.target_2_fraction + self.target_3_fraction - 1) > 1e-9:
+            raise ValueError("partial target fractions must sum to 1.0")
+        return self
+
+
+class ExitSettings(BaseModel):
+    dynamic_targets_enabled: bool = True
+    partial_targets: PartialTargetSettings = Field(default_factory=PartialTargetSettings)
+
+
 class ScannerWeights(BaseModel):
     technical: float = Field(ge=0)
     momentum: float = Field(ge=0)
@@ -159,6 +203,9 @@ class Settings(BaseModel):
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     market_regime: MarketRegimeSettings = Field(default_factory=MarketRegimeSettings)
+    potential: PotentialSettings = Field(default_factory=PotentialSettings)
+    exit: ExitSettings = Field(default_factory=ExitSettings)
+    strategy: StrategySettings = Field(default_factory=StrategySettings)
 
 
 def load_settings(path: str | Path = "config.yaml", capital: float | None = None) -> Settings:
@@ -210,6 +257,10 @@ def _normalize_alternate_config(source: dict) -> dict:
         "dashboard":source.get("dashboard",{}),
         "market_data":source.get("market_data",{}),
         "market_regime":source.get("market_regime",{}),
+        "potential":source.get("potential",{}),
+        "exit":{"dynamic_targets_enabled":exits.get("dynamic_targets_enabled",True),
+            "partial_targets":exits.get("partial_targets",{})},
+        "strategy":{"minimum_risk_reward_ratio":strategy.get("minimum_risk_reward_ratio",1.5)},
         "scoring":{**{key:final_score.get(key,value) for key,value in {"technical":.3,"momentum":.2,"volume":.15,
             "news_kap":.2,"llm":.15}.items()},"buy_threshold":strategy.get("buy_threshold",65),
             "sell_threshold":strategy.get("sell_threshold",35)}}

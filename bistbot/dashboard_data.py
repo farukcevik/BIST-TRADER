@@ -72,6 +72,7 @@ class DashboardDataService:
 
     def _positions(self,connection) -> list[dict]:
         rows=list(connection.execute("SELECT * FROM paper_positions ORDER BY symbol")); now=datetime.now(timezone.utc); output=[]
+        plans=self._entry_plans(connection)
         for row in rows:
             columns=set(row.keys()); symbol=row["symbol"]; quantity=int(row["quantity"])
             average=Decimal(row["average_price"]); last=Decimal(row["last_price"]); high=Decimal(row["high_price"])
@@ -84,18 +85,45 @@ class DashboardDataService:
             latest_score=connection.execute("SELECT score FROM technical_signals WHERE symbol=? ORDER BY timestamp DESC LIMIT 1",(symbol,)).fetchone()
             stored_score=row["current_score"] if "current_score" in columns else None
             pnl=(last-average)*quantity; market_value=last*quantity
+            fallback_stop=average*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))
+            fallback_target=average*(Decimal("1")+Decimal(str(self.settings.risk.default_take_profit_pct)))
+            plan=plans.get(symbol,{})
+            current_stop=_optional_float(plan.get("current_stop_price"))
+            initial_stop=_optional_float(plan.get("initial_stop_price"))
             output.append({"symbol":symbol,"quantity":quantity,"average_entry":float(average),"last_price":float(last),
                 "market_value":float(market_value),"unrealized_pnl":float(pnl),
                 "unrealized_pnl_pct":float((last/average-1)*100),
                 "entry_score":entry_score[0] if entry_score else None,
                 "current_score":None if stale else (stored_score if stored_score is not None else (latest_score[0] if latest_score else None)),
                 "last_known_score":stored_score if stored_score is not None else (latest_score[0] if latest_score else None),
-                "stop_price":float(average*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))),
-                "take_profit_price":float(average*(Decimal("1")+Decimal(str(self.settings.risk.default_take_profit_pct)))),
+                "stop_price":current_stop if current_stop is not None else float(fallback_stop),
+                "initial_stop_price":initial_stop if initial_stop is not None else float(fallback_stop),
+                "current_stop_price":current_stop if current_stop is not None else float(fallback_stop),
+                "take_profit_price":_optional_float(plan.get("target_2")) or float(fallback_target),
+                "target_1":_optional_float(plan.get("target_1")),"target_2":_optional_float(plan.get("target_2")),
+                "target_3":_optional_float(plan.get("target_3")),"potential_score":_optional_float(plan.get("potential_score")),
+                "expected_upside_pct":_optional_float(plan.get("expected_upside_pct")),
+                "downside_risk_pct":_optional_float(plan.get("downside_risk_pct")),
+                "risk_reward_ratio":_optional_float(plan.get("risk_reward_ratio")),
+                "holding_horizon":plan.get("holding_horizon") or "LEGACY",
+                "target_confidence":plan.get("target_confidence") or "LEGACY",
+                "target_method":plan.get("target_method") or "LEGACY_FIXED_EXIT",
+                "target_components_json":plan.get("target_components_json") or "{}",
+                "exit_stage":plan.get("exit_stage") or "LEGACY_FIXED_EXIT",
                 "trailing_stop":float(high*(Decimal("1")-Decimal(str(self.settings.risk.default_trailing_stop_pct)))),
                 "highest_price":float(high),"opened_at":row["opened_at"],"updated_at":row["updated_at"],
                 "market_data_status":"STALE_MARKET_DATA" if stale else "FRESH"})
         return output
+
+    @staticmethod
+    def _entry_plans(connection) -> dict[str,dict]:
+        """Read entry plans without assuming that a legacy database was migrated."""
+        tables={row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('paper_entry_plans','entry_plans')")}
+        table="paper_entry_plans" if "paper_entry_plans" in tables else ("entry_plans" if "entry_plans" in tables else None)
+        if table is None:return {}
+        rows=connection.execute(f"SELECT * FROM {table} ORDER BY updated_at")
+        return {row["symbol"]:dict(row) for row in rows}
 
     @staticmethod
     def _trades(connection) -> list[dict]:
@@ -183,3 +211,8 @@ def _parse_one_timestamp(value):
 def _timestamp_sort_key(value):
     parsed=_parse_one_timestamp(value)
     return parsed or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _optional_float(value):
+    try:return None if value is None else float(value)
+    except (TypeError,ValueError):return None

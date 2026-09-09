@@ -87,3 +87,38 @@ def test_total_net_pnl_is_equity_minus_capital_not_realized_plus_unrealized(tmp_
     data=DashboardDataService(path,settings).load()
     assert data["summary"]["equity"]-data["summary"]["initial_capital"]==pytest.approx(100)
     assert data["summary"]["realized"]==0 and data["summary"]["unrealized"]==pytest.approx(100)
+
+
+def test_open_position_projects_persisted_dynamic_exit_plan_read_only(tmp_path):
+    path=tmp_path/"plan.db"; settings=load_settings("config.v1.yaml"); database=Database(str(path))
+    broker=PaperBroker(10_000,database=database,risk_settings=settings.risk,clock=lambda:NOW)
+    signal=TradeSignal(symbol="AAA.IS",action=Action.BUY,score=82,reason="ENTRY",strategy_version="test",
+        requested_price=100,timestamp=NOW)
+    decision=RiskDecision(signal_id=signal.id,outcome=RiskOutcome.APPROVE,
+        reason_code=RiskReasonCode.APPROVED,reason="approved",approved_quantity=10)
+    broker.buy(signal,decision)
+    database.execute("""INSERT INTO entry_plans(entry_plan_id,symbol,entry_price,initial_stop_price,
+        current_stop_price,target_1,target_2,target_3,potential_score,expected_upside_pct,downside_risk_pct,
+        risk_reward_ratio,holding_horizon,target_confidence,target_method,target_components_json,created_at,updated_at,
+        exit_stage,original_quantity,target_1_quantity,target_2_quantity,plan_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("plan-1","AAA.IS","100","95","97","106","112","120",81,.12,.05,2.4,"SWING","HIGH",
+         "STRUCTURE_ATR",json.dumps({"atr_target":112}),NOW.isoformat(),NOW.isoformat(),"TP1_REACHED",10,2,3,"DYNAMIC"))
+    database.close()
+
+    position=DashboardDataService(path,settings).load()["positions"][0]
+    assert position["initial_stop_price"]==95 and position["current_stop_price"]==97
+    assert [position[f"target_{number}"] for number in (1,2,3)]==[106,112,120]
+    assert position["risk_reward_ratio"]==2.4 and position["exit_stage"]=="TP1_REACHED"
+
+
+def test_legacy_position_is_explicitly_labeled(tmp_path):
+    path=tmp_path/"legacy.db"; settings=load_settings("config.v1.yaml"); database=Database(str(path))
+    broker=PaperBroker(10_000,database=database,risk_settings=settings.risk,clock=lambda:NOW)
+    signal=TradeSignal(symbol="OLD.IS",action=Action.BUY,score=70,reason="legacy",strategy_version="test",
+        requested_price=100,timestamp=NOW)
+    decision=RiskDecision(signal_id=signal.id,outcome=RiskOutcome.APPROVE,
+        reason_code=RiskReasonCode.APPROVED,reason="approved",approved_quantity=5)
+    broker.buy(signal,decision); database.close()
+    position=DashboardDataService(path,settings).load()["positions"][0]
+    assert position["target_1"] is None and position["target_method"]=="LEGACY_FIXED_EXIT"
+    assert position["exit_stage"]=="LEGACY_FIXED_EXIT"

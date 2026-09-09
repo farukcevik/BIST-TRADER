@@ -19,6 +19,23 @@ exit:
   default_stop_loss_pct: 0.05
   default_take_profit_pct: 0.10
   trailing_stop_pct: 0.045
+  dynamic_targets_enabled: true
+  partial_targets: {target_1_fraction: 0.25, target_2_fraction: 0.25, target_3_fraction: 0.50}
+
+potential:
+  enabled: true
+  atr_target_min_multiplier: 1.5
+  atr_target_max_multiplier: 3.0
+  catalyst_adjustment_max_pct: 0.015
+  stop_min_pct: 0.03
+  stop_max_pct: 0.08
+  target_revaluation_enabled: true
+  # Material triggers only; the asymmetric bounds prevent upward target chasing.
+  revaluation_swing_atr_threshold: 0.5
+  revaluation_volatility_change_pct: 0.25
+  revaluation_trend_drop_points: 15
+  target_revision_max_up_pct: 0.08
+  target_revision_max_down_pct: 0.10
 
 scanner:
   universe_limit: 523
@@ -47,6 +64,7 @@ strategy:
   buy_threshold: 72
   strong_buy_threshold: 82
   sell_threshold: 38
+  minimum_risk_reward_ratio: 1.5
 
 paper:
   commission_pct: 0.001

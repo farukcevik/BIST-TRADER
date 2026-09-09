@@ -7,6 +7,10 @@ dependencies = ["pydantic>=2.7", "PyYAML>=6.0", "certifi>=2025.0", "openai>=1.0"
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
+[tool.bistbot_ci]
+python_paths = ["bistbot", "tests", "tools", "dashboard.py", "main.py"]
+secret_scan_paths = ["."]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

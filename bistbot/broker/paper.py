@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import datetime,timedelta,timezone
-from decimal import Decimal,ROUND_HALF_UP
+from decimal import Decimal,ROUND_FLOOR,ROUND_HALF_UP
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 from bistbot.app.config import RiskSettings
@@ -29,18 +30,69 @@ class PaperBroker:
     def __init__(self,starting_cash: Decimal|str|int|float=Decimal("200000"),commission_pct: float=0,
                  slippage_pct: float=0,*,database: Database|None=None,risk_settings: RiskSettings|None=None,
                  notifier: SafeNotificationDispatcher|None=None,calendar: BistTradingCalendar|None=None,
-                 yahoo_execution_freshness_seconds:int|None=None,clock:Callable[[],datetime]|None=None):
+                 yahoo_execution_freshness_seconds:int|None=None,clock:Callable[[],datetime]|None=None,
+                 exit_settings:Any|None=None):
         self.database=database or Database(":memory:"); self.risk_settings=risk_settings
         self.commission_pct=Decimal(str(commission_pct)); self.slippage_pct=Decimal(str(slippage_pct))
         self.notifier=notifier or SafeNotificationDispatcher()
         self.calendar=calendar or BistTradingCalendar()
         self.yahoo_execution_freshness_seconds=yahoo_execution_freshness_seconds
+        self.exit_settings=exit_settings
         self.clock=clock or (lambda:datetime.now(timezone.utc))
         capital=money(starting_cash)
         if capital<=0 or self.commission_pct<0 or self.slippage_pct<0: raise ValueError("invalid paper broker configuration")
         self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_cash',?)",(str(capital),))
         self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_initial_capital',?)",(str(capital),))
         self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_realized_pnl','0.00')")
+        self._ensure_legacy_entry_plans()
+
+    def _ensure_legacy_entry_plans(self) -> None:
+        """Give pre-feature positions an explicit, conservative fixed-exit plan."""
+        now=_aware_utc(self.clock()).isoformat()
+        stop_pct=Decimal(str(self.risk_settings.default_stop_loss_pct if self.risk_settings else ".05"))
+        take_pct=Decimal(str(self.risk_settings.default_take_profit_pct if self.risk_settings else ".10"))
+        for row in self.database.query("SELECT * FROM paper_positions"):
+            if self.database.query("SELECT 1 FROM entry_plans WHERE symbol=?",(row["symbol"],)): continue
+            entry=Decimal(row["average_price"]); stop=entry*(Decimal("1")-stop_pct); target=entry*(Decimal("1")+take_pct)
+            self.database.execute("INSERT INTO entry_plans(entry_plan_id,symbol,entry_price,initial_stop_price,current_stop_price,target_1,target_2,target_3,expected_upside_pct,downside_risk_pct,risk_reward_ratio,potential_score,holding_horizon,target_confidence,target_method,target_components_json,created_at,updated_at,exit_stage,original_quantity,target_1_quantity,target_2_quantity,target_3_quantity,plan_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid4()),row["symbol"],str(entry),str(stop),str(stop),str(target),str(target),str(target),
+                 float(take_pct),float(stop_pct),float(take_pct/stop_pct),0,"SWING","LOW","LEGACY_FIXED_EXIT",
+                 json.dumps({"legacy_default_take_profit_pct":float(take_pct)}),row["opened_at"],now,"INITIAL",
+                 row["quantity"],0,0,row["quantity"],"LEGACY_FIXED_EXIT"))
+
+    def get_entry_plan(self,symbol: str) -> dict[str,Any]|None:
+        rows=self.database.query("SELECT * FROM entry_plans WHERE symbol=?",(symbol,))
+        if not rows:return None
+        result=dict(rows[0]); result["target_components"]=json.loads(result.pop("target_components_json"))
+        return result
+
+    def get_entry_plans(self) -> dict[str,dict[str,Any]]:
+        return {row["symbol"]:self.get_entry_plan(row["symbol"]) for row in self.database.query("SELECT symbol FROM entry_plans")}
+
+    def revise_entry_plan(self,symbol:str,revised:Any,trigger:str,now:datetime)->None:
+        """Atomically persist a bounded deterministic revision and its audit record."""
+        before=self.get_entry_plan(symbol)
+        if before is None or before["plan_mode"]!="DYNAMIC": raise KeyError(symbol)
+        plan=revised.model_dump(mode="json") if hasattr(revised,"model_dump") else dict(revised)
+        old_stop=Decimal(before["current_stop_price"])
+        new_stop=max(old_stop,Decimal(str(plan["initial_stop_price"])))
+        original_entry=Decimal(before["entry_price"])
+        original_initial_stop=Decimal(before["initial_stop_price"])
+        downside=(original_entry-original_initial_stop)/original_entry
+        upside=(Decimal(str(plan["target_2"]))-original_entry)/original_entry
+        if downside<=0 or upside<=0: raise ValueError("revised entry plan has invalid economics")
+        with self.database.connection:
+            connection=self.database.connection
+            connection.execute("UPDATE entry_plans SET current_stop_price=?,target_1=?,target_2=?,target_3=?,expected_upside_pct=?,downside_risk_pct=?,risk_reward_ratio=?,potential_score=?,holding_horizon=?,target_confidence=?,target_method=?,target_components_json=?,updated_at=? WHERE symbol=?",
+                (str(new_stop),str(plan["target_1"]),str(plan["target_2"]),str(plan["target_3"]),
+                 float(upside),float(downside),float(upside/downside),plan["potential_score"],
+                 str(plan["holding_horizon"]),str(plan["target_confidence"]),plan["target_method"],
+                 json.dumps(plan["target_components"],ensure_ascii=False),now.isoformat(),symbol))
+            after=dict(connection.execute("SELECT * FROM entry_plans WHERE symbol=?",(symbol,)).fetchone())
+            after["target_components"]=json.loads(after.pop("target_components_json"))
+            connection.execute("INSERT INTO entry_plan_revisions(entry_plan_id,symbol,trigger,created_at,before_json,after_json) VALUES(?,?,?,?,?,?)",
+                (before["entry_plan_id"],symbol,trigger,now.isoformat(),json.dumps(before,default=str,ensure_ascii=False),
+                 json.dumps(after,default=str,ensure_ascii=False)))
 
     def get_cash(self) -> Decimal:
         return money(self.database.query("SELECT value FROM metadata WHERE key='paper_cash'")[0]["value"])
@@ -88,27 +140,45 @@ class PaperBroker:
         return state
 
     def buy(self,signal: TradeSignal,risk_decision: RiskDecision,*,execution_time: datetime|None=None,
-            execution_provider:str|None=None) -> PaperOrder:
+            execution_provider:str|None=None,entry_plan:Any|None=None) -> PaperOrder:
         if signal.action is not Action.BUY: raise ValueError("buy requires BUY signal")
         if signal.symbol in self.get_positions(): raise ValueError("existing paper position; pyramiding disabled")
         if risk_decision.signal_id!=signal.id or not risk_decision.approved:
             self.notify_risk_rejection(signal.symbol,risk_decision); raise PermissionError("risk decision does not approve this signal")
         self._guard_execution(signal.timestamp,signal.requested_price,execution_time or signal.timestamp,execution_provider)
-        return self._fill(signal,risk_decision.approved_quantity,risk_decision)
+        if entry_plan is not None:
+            plan=entry_plan.model_dump(mode="json") if hasattr(entry_plan,"model_dump") else dict(entry_plan)
+            fill=self._model_fill(signal)
+            stop=Decimal(str(plan["initial_stop_price"])); targets=[Decimal(str(plan[f"target_{index}"])) for index in (1,2,3)]
+            if not stop<fill<targets[0]<=targets[1]<=targets[2]:
+                raise ValueError("execution fill violates entry plan ordering")
+            if self.risk_settings is not None:
+                risk_budget=self.get_portfolio_state().equity*Decimal(str(self.risk_settings.max_trade_risk_pct))
+                maximum=int((risk_budget/(fill-stop)).to_integral_value(rounding=ROUND_FLOOR))
+                if maximum<=0: raise PermissionError("slippage-adjusted fill exceeds trade risk budget")
+                if risk_decision.approved_quantity>maximum:
+                    risk_decision=risk_decision.model_copy(update={"outcome":RiskOutcome.REDUCE_SIZE,
+                        "reason_code":RiskReasonCode.MAX_TRADE_RISK,"reason":"Reduced for slippage-adjusted fill risk",
+                        "approved_quantity":maximum,"metadata":{**risk_decision.metadata,
+                            "slippage_adjusted_fill":str(fill),"slippage_risk_maximum":maximum}})
+        return self._fill(signal,risk_decision.approved_quantity,risk_decision,entry_plan=entry_plan)
 
     def sell(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision,*,execution_time: datetime|None=None,
-             execution_provider:str|None=None) -> PaperOrder:
+             execution_provider:str|None=None,_entry_plan_stage:str|None=None,
+             _entry_plan_stop:Decimal|None=None) -> PaperOrder:
         if signal.action is not Action.SELL: raise ValueError("sell requires SELL signal")
         if (risk_decision.signal_id!=signal.id or not risk_decision.approved or
                 quantity>risk_decision.approved_quantity): raise PermissionError("sell is not approved")
         self._guard_execution(signal.timestamp,signal.requested_price,execution_time or signal.timestamp,execution_provider)
-        return self._fill(signal,quantity,risk_decision)
+        return self._fill(signal,quantity,risk_decision,entry_plan_stage=_entry_plan_stage,
+                          entry_plan_stop=_entry_plan_stop)
 
-    def _fill(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision) -> PaperOrder:
+    def _fill(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision,*,entry_plan:Any|None=None,
+              entry_plan_stage:str|None=None,entry_plan_stop:Decimal|None=None) -> PaperOrder:
         if quantity<=0: raise ValueError("quantity must be positive")
         requested=Decimal(str(signal.requested_price)); side_multiplier=(Decimal("1")+self.slippage_pct
             if signal.action is Action.BUY else Decimal("1")-self.slippage_pct)
-        fill=(requested*side_multiplier).quantize(PRICE_STEP,rounding=ROUND_HALF_UP)
+        fill=self._model_fill(signal)
         commission=money(fill*quantity*self.commission_pct); now=signal.timestamp
         positions=self.get_positions(); old=positions.get(signal.symbol); cash=self.get_cash()
         high_rows=self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(signal.symbol,))
@@ -145,10 +215,53 @@ class PaperBroker:
                 (position.symbol,position.quantity,str(position.average_price),str(position.last_price),str(max(stored_high,fill)),position.opened_at.isoformat(),position.updated_at.isoformat(),position.updated_at.isoformat(),"FRESH"))
             connection.execute("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(str(order.id),str(order.signal_id),order.symbol,order.side.value,order.quantity,str(order.requested_price),str(order.fill_price),order.timestamp.isoformat(),order.reason,order.final_score,order.risk_decision.model_dump_json(),order.strategy_version,order.status.value,order.model_dump_json()))
             connection.execute("INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?,?)",(str(paper_fill.id),str(paper_fill.order_id),paper_fill.timestamp.isoformat(),paper_fill.symbol,paper_fill.side.value,paper_fill.quantity,str(paper_fill.fill_price),str(paper_fill.commission),str(paper_fill.realized_pnl),paper_fill.model_dump_json()))
+            if signal.action is Action.BUY and entry_plan is not None:
+                plan=entry_plan.model_dump(mode="json") if hasattr(entry_plan,"model_dump") else dict(entry_plan)
+                components=plan.get("target_components",{})
+                q1,q2,q3=self._partial_quantities(quantity)
+                downside=(fill-Decimal(str(plan["initial_stop_price"])))/fill
+                upside=(Decimal(str(plan["target_2"]))-fill)/fill
+                connection.execute("INSERT INTO entry_plans(entry_plan_id,symbol,entry_price,initial_stop_price,current_stop_price,target_1,target_2,target_3,expected_upside_pct,downside_risk_pct,risk_reward_ratio,potential_score,holding_horizon,target_confidence,target_method,target_components_json,created_at,updated_at,exit_stage,original_quantity,target_1_quantity,target_2_quantity,target_3_quantity,plan_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (str(plan.get("entry_plan_id",uuid4())),signal.symbol,str(fill),str(plan["initial_stop_price"]),
+                     str(plan.get("current_stop_price",plan["initial_stop_price"])),str(plan["target_1"]),str(plan["target_2"]),str(plan["target_3"]),
+                     float(upside),float(downside),float(upside/downside),plan["potential_score"],
+                     str(plan["holding_horizon"]),str(plan["target_confidence"]),plan["target_method"],json.dumps(components,ensure_ascii=False),
+                     str(plan.get("created_at",now.isoformat())),str(plan.get("updated_at",now.isoformat())),"INITIAL",quantity,q1,q2,q3,"DYNAMIC"))
+            if signal.action is Action.SELL:
+                if position is None: connection.execute("DELETE FROM entry_plans WHERE symbol=?",(signal.symbol,))
+                elif entry_plan_stage is not None:
+                    connection.execute("UPDATE entry_plans SET exit_stage=?,current_stop_price=MAX(CAST(current_stop_price AS REAL),CAST(? AS REAL)),updated_at=? WHERE symbol=?",
+                                       (entry_plan_stage,str(entry_plan_stop),now.isoformat(),signal.symbol))
         self.notifier.send("BUY" if signal.action is Action.BUY else "SELL",f"{signal.symbol} x{quantity} @ {fill}")
         if signal.action is Action.SELL and signal.reason in {reason.value for reason in ExitReason}:
             self.notifier.send(signal.reason,f"{signal.symbol} x{quantity} @ {fill}")
         return order
+
+    def _model_fill(self,signal:TradeSignal)->Decimal:
+        requested=Decimal(str(signal.requested_price))
+        multiplier=Decimal("1")+self.slippage_pct if signal.action is Action.BUY else Decimal("1")-self.slippage_pct
+        return (requested*multiplier).quantize(PRICE_STEP,rounding=ROUND_HALF_UP)
+
+    def _partial_quantities(self,quantity:int)->tuple[int,int,int]:
+        partial=getattr(getattr(self,"exit_settings",None),"partial_targets",None)
+        first=Decimal(str(getattr(partial,"target_1_fraction",.25)))
+        second=Decimal(str(getattr(partial,"target_2_fraction",.25)))
+        third=Decimal(str(getattr(partial,"target_3_fraction",.50)))
+        fractions=(first,second,third)
+        # When there are fewer shares than enabled stages, assign them to the
+        # earliest objectives. This gives tiny positions a deterministic exit
+        # without ever submitting a zero-share order.
+        enabled=[index for index,value in enumerate(fractions) if value>0]
+        if quantity<=len(enabled):
+            result=[0,0,0]
+            for index in enabled[:quantity]:result[index]=1
+            return result[0],result[1],result[2]
+        exact=[Decimal(quantity)*value for value in fractions]
+        result=[int(value.to_integral_value(rounding=ROUND_FLOOR)) for value in exact]
+        remaining=quantity-sum(result)
+        order=sorted(range(3),key=lambda index:(exact[index]-result[index],-index),reverse=True)
+        for index in order[:remaining]:result[index]+=1
+        return result[0],result[1],result[2]
 
     def refresh_position(self,symbol: str,price: Decimal,*,data_timestamp: datetime,current_score: float|None=None) -> Decimal:
         """Persist one verified market mark. High-water mark can only increase."""
@@ -178,14 +291,33 @@ class PaperBroker:
             if not validation.valid:continue
             if update_marks: high=self._update_high(symbol,price,now)
             else: high=Decimal(self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(symbol,))[0]["high_price"])
-            reason=None
-            if price<=position.average_price*(Decimal("1")-Decimal(str(self.risk_settings.default_stop_loss_pct))): reason=ExitReason.HARD_STOP
+            plan=self.get_entry_plan(symbol); reason=None; quantity=position.quantity; next_stage=None
+            current_stop=(Decimal(plan["current_stop_price"]) if plan else
+                          position.average_price*(Decimal("1")-Decimal(str(self.risk_settings.default_stop_loss_pct))))
+            if price<=current_stop: reason=ExitReason.HARD_STOP
+            elif plan and plan["plan_mode"]=="DYNAMIC":
+                stage=plan["exit_stage"]
+                q1,q2,q3=(int(plan[f"target_{index}_quantity"]) for index in (1,2,3))
+                # A gap through multiple targets realizes every crossed tranche
+                # in one actual fill rather than leaving stale lower stages open.
+                if price>=Decimal(plan["target_3"]) and stage in {"INITIAL","TP1_REACHED","TP2_REACHED"}:
+                    planned={"INITIAL":q1+q2+q3,"TP1_REACHED":q2+q3,"TP2_REACHED":q3}[stage]
+                    quantity=min(position.quantity,planned); reason="TARGET 3"; next_stage="RUNNER"
+                elif price>=Decimal(plan["target_2"]) and stage in {"INITIAL","TP1_REACHED"}:
+                    planned=q1+q2 if stage=="INITIAL" else q2
+                    quantity=min(position.quantity,planned); reason="TARGET 2"; next_stage="TP2_REACHED"
+                elif price>=Decimal(plan["target_1"]) and stage=="INITIAL" and q1>0:
+                    quantity=min(position.quantity,q1); reason="TARGET 1"; next_stage="TP1_REACHED"
+                if reason is not None and quantity<=0:
+                    reason=None; next_stage=None
             elif price>=position.average_price*(Decimal("1")+Decimal(str(self.risk_settings.default_take_profit_pct))): reason=ExitReason.TAKE_PROFIT
-            elif price<=high*(Decimal("1")-Decimal(str(self.risk_settings.default_trailing_stop_pct))): reason=ExitReason.TRAILING_STOP
-            elif symbol in strategy_exit_symbols: reason=ExitReason.STRATEGY_EXIT
-            elif now-position.opened_at>=timedelta(days=self.risk_settings.max_holding_days): reason=ExitReason.TIME_STOP
+            if reason is None:
+                if price<=high*(Decimal("1")-Decimal(str(self.risk_settings.default_trailing_stop_pct))): reason=ExitReason.TRAILING_STOP
+                elif symbol in strategy_exit_symbols: reason=ExitReason.STRATEGY_EXIT
+                elif now-position.opened_at>=timedelta(days=self.risk_settings.max_holding_days): reason=ExitReason.TIME_STOP
             if reason:
-                signal=TradeSignal(symbol=symbol,action=Action.SELL,score=0,reason=reason.value,
+                reason_value=reason.value if isinstance(reason,ExitReason) else reason
+                signal=TradeSignal(symbol=symbol,action=Action.SELL,score=0,reason=reason_value,
                     strategy_version=strategy_version,requested_price=float(price),timestamp=price_timestamps.get(symbol,now))
                 from bistbot.risk.engine import DeterministicRiskEngine,GlobalKillSwitch
                 risk_engine=DeterministicRiskEngine(self.risk_settings,RiskDecisionRepository(self.database),
@@ -194,10 +326,25 @@ class PaperBroker:
                 from bistbot.app.models import RiskOrderRequest
                 decision=risk_engine.evaluate(RiskOrderRequest(signal_id=signal.id,symbol=symbol,action=Action.SELL,
                     entry_price=price,price_timestamp=signal.timestamp,execution_quote_validation=validation,
-                    requested_quantity=position.quantity),state,now)
-                exits.append(self.sell(signal,position.quantity,decision,execution_time=now,
-                    execution_provider=execution_provider))
+                    requested_quantity=quantity),state,now)
+                promoted_stop=None
+                if next_stage=="TP1_REACHED": promoted_stop=position.average_price
+                elif next_stage in {"TP2_REACHED","RUNNER"}:
+                    promoted_stop=high*(Decimal("1")-Decimal(str(self.risk_settings.default_trailing_stop_pct)))
+                order=self.sell(signal,quantity,decision,execution_time=now,
+                    execution_provider=execution_provider,_entry_plan_stage=next_stage,
+                    _entry_plan_stop=promoted_stop)
+                exits.append(order)
         return exits
+
+    def _promote_stop(self,symbol:str,stage:str,entry:Decimal,high:Decimal,now:datetime)->None:
+        row=self.get_entry_plan(symbol)
+        if row is None:return
+        current=Decimal(row["current_stop_price"])
+        if stage=="TP1_REACHED": proposed=entry
+        else: proposed=high*(Decimal("1")-Decimal(str(self.risk_settings.default_trailing_stop_pct)))
+        self.database.execute("UPDATE entry_plans SET current_stop_price=?,updated_at=? WHERE symbol=?",
+                              (str(max(current,proposed)),now.isoformat(),symbol))
 
     def _update_high(self,symbol: str,price: Decimal,now: datetime) -> Decimal:
         row=self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(symbol,))[0]

@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Action(StrEnum):
@@ -285,6 +285,60 @@ class StrategyDecision(BaseModel):
     reason: str
     signal_mode: SignalMode = SignalMode.TECHNICAL_ONLY
     score_breakdown: dict[str, Any] = Field(default_factory=dict)
+
+
+class HoldingHorizon(StrEnum):
+    INTRADAY = "INTRADAY"
+    SHORT_SWING = "SHORT_SWING"
+    SWING = "SWING"
+    POSITION = "POSITION"
+
+
+class TargetConfidence(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+class TargetComponents(BaseModel):
+    """Auditable, market-derived inputs used to construct an entry plan."""
+    resistance_target: float | None = Field(default=None, gt=0)
+    swing_high_target: float | None = Field(default=None, gt=0)
+    atr_target: float = Field(gt=0)
+    trend_extension_target: float = Field(gt=0)
+    catalyst_adjustment_pct: float = Field(ge=-0.02, le=0.02)
+    support_price: float | None = Field(default=None, gt=0)
+    swing_low_price: float | None = Field(default=None, gt=0)
+    atr_stop_price: float = Field(gt=0)
+    selected_base_target: float = Field(gt=0)
+    decision_timestamp: datetime
+    bars_used: int = Field(gt=0)
+    atr_value: float | None = Field(default=None, gt=0)
+    trend_score: float | None = Field(default=None, ge=0, le=100)
+    market_regime: MarketRegime | None = None
+
+
+class EntryPlan(BaseModel):
+    symbol: str
+    entry_price: float = Field(gt=0)
+    initial_stop_price: float = Field(gt=0)
+    target_1: float = Field(gt=0)
+    target_2: float = Field(gt=0)
+    target_3: float = Field(gt=0)
+    expected_upside_pct: float = Field(gt=0)
+    downside_risk_pct: float = Field(gt=0)
+    risk_reward_ratio: float = Field(gt=0)
+    potential_score: float = Field(ge=0, le=100)
+    holding_horizon: HoldingHorizon
+    target_confidence: TargetConfidence
+    target_method: str
+    target_components: TargetComponents
+
+    @model_validator(mode="after")
+    def prices_are_ordered(self) -> "EntryPlan":
+        if not self.initial_stop_price < self.entry_price < self.target_1 <= self.target_2 <= self.target_3:
+            raise ValueError("entry plan prices must satisfy stop < entry < target_1 <= target_2 <= target_3")
+        return self
 
 
 class NewsItem(BaseModel):

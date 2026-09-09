@@ -29,6 +29,8 @@ st.caption(f"Auto-refresh: approximately every {REFRESH_SECONDS} seconds. Quotes
 
 def money(value): return f"₺{value:,.2f}"
 def percentage(value): return f"{value:+.2f}%"
+def optional_money(value): return "—" if value is None else money(value)
+def optional_percentage(value): return "—" if value is None else percentage(value)
 
 
 def display_timestamps(frame,column):
@@ -178,6 +180,35 @@ def dashboard():
                 subset=["Live P&L TL","Live P&L %"])
         st.dataframe(styled,use_container_width=True,hide_index=True)
 
+        st.subheader("DYNAMIC EXIT PLAN")
+        exit_plans=positions.copy()
+        for number in (1,2,3):
+            target=f"target_{number}"; distance=f"distance_to_target_{number}"
+            exit_plans[distance]=exit_plans.apply(
+                lambda row: ((row[target]/row["live_price"])-1)*100
+                if pd.notna(row.get(target)) and row.get("live_price",0)>0 else None,axis=1)
+        exit_plans=exit_plans.rename(columns={"symbol":"Symbol","average_entry":"Entry","live_price":"Current Price",
+            "live_unrealized_pnl":"Current P&L","initial_stop_price":"Initial Stop","current_stop_price":"Current Stop",
+            "target_1":"Target 1","target_2":"Target 2","target_3":"Target 3","potential_score":"Potential Score",
+            "expected_upside_pct":"Expected Upside","risk_reward_ratio":"Risk / Reward",
+            "target_confidence":"Target Confidence","holding_horizon":"Holding Horizon","exit_stage":"Exit Stage",
+            "distance_to_target_1":"Distance to Target 1","distance_to_target_2":"Distance to Target 2",
+            "distance_to_target_3":"Distance to Target 3"})
+        plan_columns=["Symbol","Entry","Current Price","Current P&L","Initial Stop","Current Stop","Target 1","Target 2",
+            "Target 3","Potential Score","Expected Upside","Risk / Reward","Target Confidence","Holding Horizon","Exit Stage",
+            "Distance to Target 1","Distance to Target 2","Distance to Target 3"]
+        st.dataframe(exit_plans[plan_columns].style.format({
+            "Entry":"₺{:,.4f}","Current Price":"₺{:,.4f}","Current P&L":"₺{:+,.2f}","Initial Stop":"₺{:,.4f}",
+            "Current Stop":"₺{:,.4f}","Target 1":lambda value:"—" if pd.isna(value) else f"₺{value:,.4f}",
+            "Target 2":lambda value:"—" if pd.isna(value) else f"₺{value:,.4f}",
+            "Target 3":lambda value:"—" if pd.isna(value) else f"₺{value:,.4f}",
+            "Expected Upside":lambda value:"—" if pd.isna(value) else f"{value*100:+.2f}%",
+            "Risk / Reward":lambda value:"—" if pd.isna(value) else f"{value:.2f}",
+            "Distance to Target 1":lambda value:"—" if pd.isna(value) else f"{value:+.2f}%",
+            "Distance to Target 2":lambda value:"—" if pd.isna(value) else f"{value:+.2f}%",
+            "Distance to Target 3":lambda value:"—" if pd.isna(value) else f"{value:+.2f}%"}),
+            use_container_width=True,hide_index=True)
+
         st.subheader("POSITION DETAIL")
         selected=st.selectbox("Symbol",positions["symbol"].tolist()); item=next(row for row in live_positions if row["symbol"]==selected)
         details={"Entry Price":money(item["average_entry"]),"Live Price":money(item["live_price"]),"Quantity":item["quantity"],
@@ -186,6 +217,14 @@ def dashboard():
             "Take Profit":money(item["take_profit_price"]),"Trailing Stop":money(item["trailing_stop"]),
             "Highest Since Entry":money(item["highest_price"]),"Opened At":item["opened_at"],"Updated At":item["updated_at"],
             "Price Timestamp":item["price_timestamp_display"],"Price Age":item["price_age"],"Price Status":item["price_status"]}
+        details.update({"Initial Stop":optional_money(item.get("initial_stop_price")),
+            "Current Stop":optional_money(item.get("current_stop_price")),"Target 1":optional_money(item.get("target_1")),
+            "Target 2":optional_money(item.get("target_2")),"Target 3":optional_money(item.get("target_3")),
+            "Potential Score":item.get("potential_score") if item.get("potential_score") is not None else "—",
+            "Expected Upside":optional_percentage(item["expected_upside_pct"]*100) if item.get("expected_upside_pct") is not None else "—",
+            "Risk / Reward":item.get("risk_reward_ratio") if item.get("risk_reward_ratio") is not None else "—",
+            "Target Confidence":item.get("target_confidence","—"),"Holding Horizon":item.get("holding_horizon","—"),
+            "Exit Stage":item.get("exit_stage","—")})
         detail_columns=st.columns(4)
         for index,(label,value) in enumerate(details.items()): detail_columns[index%4].metric(label,value)
         st.info("Per-symbol historical prices are not persisted. No synthetic position chart is shown.")
