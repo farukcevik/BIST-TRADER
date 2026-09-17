@@ -20,7 +20,9 @@ DIAGNOSTICS={
         "importance":60,"catalyst_score":55,"priced_in_probability":45,"risk_score":30,
         "confidence":35,"action_bias":"HOLD","final_score":76.4,"decision":"HOLD",
         "reason":"final_score 76.4 below buy_threshold 78","news_status":"NO_NEWS",
-        "llm_status":"NOT_REQUIRED","signal_mode":"TECHNICAL_ONLY"}],
+        "llm_status":"NOT_REQUIRED","signal_mode":"TECHNICAL_ONLY",
+        "fundamental":{"fundamental_score":100,"effective_score":48.73,"coverage":38.46,
+            "confidence":49.42}}],
     "risk":[{"symbol":"BBB","proposed_position_value":"25000.00","proposed_quantity":250,
         "stop_price":"96.00","maximum_allowed_risk":"1000.00","risk_decision":"REDUCE_SIZE",
         "reason_code":"MAX_POSITION_SIZE","reason":"Requested quantity reduced"}],
@@ -44,8 +46,60 @@ def test_verbose_formatter_prints_scores_hold_reason_and_risk(capsys):
     cli.print_verbose_diagnostics(DIAGNOSTICS); output=capsys.readouterr().out
     assert "TOP 40 SCANNER CANDIDATES" in output and "trend_score=79.00" in output
     assert "TOP 10 INTELLIGENCE / LLM CANDIDATES" in output and "priced_in_probability: 45" in output
+    assert "raw_score: 100" in output and "effective_score: 48.73" in output
+    assert "coverage: 38.46" in output and "confidence: 49.42" in output
     assert "HOLD REASON" in output and "final_score 76.4 below buy_threshold 78" in output
     assert "RISK DECISION" in output and "reason_code: MAX_POSITION_SIZE" in output
+
+
+def test_verbose_formatter_prints_valid_multi_target_potential(capsys):
+    diagnostics={"candidates":[{"symbol":"AAA","decision":"HOLD","final_score":70,"reason":"fixture",
+        "news_status":"NO_NEWS","llm_status":"NOT_REQUIRED","signal_mode":"STAGED_INVESTMENT",
+        "latest_price":100,"potential":{"available":True,"downside_reference":96,
+            "downside_risk_pct":4,"target_1":104,"target_2":108,"target_3":112,
+            "rr_t1":1,"rr_t2":2,"rr_t3":3,"entry_rr":1.5}}]}
+
+    cli.print_verbose_diagnostics(diagnostics); output=capsys.readouterr().out
+
+    assert "Potential: VALID" in output
+    assert "Entry: 100" in output and "Dynamic Stop: 96" in output and "Dynamic Stop %: 4" in output
+    assert "T1: 104" in output and "T2: 108" in output and "T3: 112" in output
+    assert "RR_T1: 1" in output and "RR_T2: 2" in output and "RR_T3: 3" in output
+    assert "Final entry_rr: 1.5" in output
+
+
+def test_verbose_formatter_explains_rejected_potential(capsys):
+    diagnostics={"candidates":[{"symbol":"AAA","decision":"HOLD","final_score":70,"reason":"fixture",
+        "news_status":"NO_NEWS","llm_status":"NOT_REQUIRED","signal_mode":"STAGED_INVESTMENT",
+        "latest_price":100,"potential":{"available":False,
+            "unavailable_reason":"INSUFFICIENT_VALIDATED_TARGETS"}}]}
+
+    cli.print_verbose_diagnostics(diagnostics); output=capsys.readouterr().out
+
+    assert "Potential: REJECTED" in output
+    assert "Potential Rejection Reason: INSUFFICIENT_VALIDATED_TARGETS" in output
+
+
+def test_verbose_formatter_identifies_missing_potential_fields_without_reason(capsys):
+    diagnostics={"candidates":[{"symbol":"AAA","decision":"HOLD","final_score":70,"reason":"fixture",
+        "news_status":"NO_NEWS","llm_status":"NOT_REQUIRED","signal_mode":"STAGED_INVESTMENT",
+        "latest_price":100,"potential":{"available":True,"downside_reference":96,"downside_risk_pct":4,
+            "target_1":104,"rr_t1":1}}]}
+
+    cli.print_verbose_diagnostics(diagnostics); output=capsys.readouterr().out
+
+    assert "Potential: REJECTED" in output
+    assert "Potential Rejection Reason: MISSING_POTENTIAL_FIELDS: target_2, rr_t2, entry_rr" in output
+
+
+def test_symbol_analysis_prints_calibrated_fundamental_diagnostics(capsys):
+    cli.print_symbol_analysis({"symbol":"TERA.IS","fundamental":{"fundamental_score":100,
+        "effective_score":43.61,"coverage":38.46,"confidence":49.42}})
+    output=capsys.readouterr().out
+    assert '"raw_score": 100' in output
+    assert '"effective_score": 43.61' in output
+    assert '"coverage": 38.46' in output
+    assert '"confidence": 49.42' in output
 
 
 def test_cycle_summary_explains_raw_buy_blocked_by_existing_position(capsys):

@@ -9,6 +9,7 @@ from decimal import Decimal
 from datetime import datetime,timezone,timedelta
 
 import certifi
+import yaml
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ from bistbot.notifications.macos import MacOSNotificationProvider
 from bistbot.notifications.telegram import TelegramNotificationProvider
 from bistbot.intelligence.openai_provider import OpenAILLMProvider
 from bistbot.storage.database import Database
+from bistbot.storage.paper_reset import reset_paper_state
 from bistbot.market.provider import _is_stale_for_bist_session
 
 
@@ -50,7 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     modes=parser.add_mutually_exclusive_group()
     modes.add_argument("--once",action="store_true"); modes.add_argument("--dry-run",action="store_true")
     modes.add_argument("--status",action="store_true"); modes.add_argument("--report",action="store_true")
-    modes.add_argument("--reset",action="store_true")
+    modes.add_argument("--reset-paper",action="store_true",
+                       help="clear all PAPER state and restore configured capital")
     modes.add_argument("--diagnose-intelligence",action="store_true",
                        help="probe news/KAP/OpenAI status without trading")
     modes.add_argument("--diagnose-regime",action="store_true",
@@ -58,7 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument("--analyze-symbol",metavar="SYMBOL",
                        help="analyze one BIST symbol without trading")
     parser.add_argument("--verbose",action="store_true",help="print detailed diagnostics with --once")
+    parser.add_argument("--confirm",action="store_true",
+                       help="explicitly confirm the destructive --reset-paper operation")
     return parser
+
+
+def configured_trading_mode(config_path: str | Path) -> str:
+    raw=yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    if "system" in raw:
+        return str(raw.get("system",{}).get("mode","PAPER")).strip().upper()
+    return str(raw.get("trading_mode","PAPER")).strip().upper()
 
 
 def print_intelligence_diagnostics(diagnostics: dict) -> None:
@@ -99,10 +111,15 @@ def print_symbol_analysis(result: dict) -> None:
     print(f"SYMBOL\n{result['symbol']}")
     sections=(("MARKET DATA","market_data"),("EVENT MATERIALITY FILTER","event_filter"),
               ("RECENT NEWS","news"),("RECENT KAP","kap"),
-              ("LLM","llm"),("STRATEGY","strategy"),("RISK","risk"))
+              ("FUNDAMENTAL","fundamental"),("LLM","llm"),("STRATEGY","strategy"),("RISK","risk"))
     for title,key in sections:
         print(f"\n{title}")
         value=result.get(key,{})
+        if key=="fundamental" and isinstance(value,dict):
+            value={"raw_score":value.get("fundamental_score"),
+                   "effective_score":value.get("effective_score"),
+                   "coverage":value.get("coverage"),
+                   "confidence":value.get("confidence"),**value}
         print(json.dumps(value,indent=2,ensure_ascii=False,default=str))
     summary=result.get("action_summary")
     if summary:
@@ -207,6 +224,48 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
                     "priced_in_probability","risk_score","confidence","action_bias","model","final_score","decision","reason"):
                 print(f"{key}: {item.get(key)}")
         print(f"news_status: {item['news_status']}\nllm_status: {item['llm_status']}\nsignal_mode: {item['signal_mode']}")
+        fundamental=item.get("fundamental") if isinstance(item.get("fundamental"),dict) else {}
+        print("FUNDAMENTAL ANALYSIS")
+        print(f"Revenue Growth: {fundamental.get('revenue_growth','UNKNOWN')}")
+        print(f"EBITDA Growth: {fundamental.get('ebitda_growth','UNKNOWN')}")
+        print(f"Net Income Growth: {fundamental.get('net_income_growth','UNKNOWN')}")
+        breakdown=fundamental.get("score_breakdown",{}) if isinstance(fundamental.get("score_breakdown"),dict) else {}
+        print(f"Cash Flow Quality: {breakdown.get('cash_flow_quality_score','UNKNOWN')}")
+        print(f"Net Debt / EBITDA: {fundamental.get('net_debt_ebitda','UNKNOWN')}")
+        print(f"Valuation: {fundamental.get('valuation_status','UNKNOWN')}")
+        print(f"raw_score: {fundamental.get('fundamental_score')}")
+        print(f"effective_score: {fundamental.get('effective_score')}")
+        print(f"coverage: {fundamental.get('coverage',0)}")
+        print(f"confidence: {fundamental.get('confidence',0)}")
+        print(f"Red Flags: {fundamental.get('red_flags',[])}")
+        levels=item.get("technical_levels") if isinstance(item.get("technical_levels"),dict) else {}
+        print("TECHNICAL LEVELS")
+        print(f"Support: {levels.get('support_1')}")
+        print(f"Resistance: {levels.get('resistance_1')}")
+        print(f"Market Structure: {levels.get('market_structure','UNKNOWN')}")
+        potential=item.get("potential") if isinstance(item.get("potential"),dict) else {}
+        print("POTENTIAL / RR")
+        required=("downside_reference","downside_risk_pct","target_1","target_2","rr_t1","rr_t2","entry_rr")
+        missing=[field for field in required if potential.get(field) is None]
+        rejected=potential.get("available") is False or bool(missing)
+        print(f"Potential: {'REJECTED' if rejected else 'VALID'}")
+        print(f"Entry: {item.get('latest_price')}")
+        print(f"Dynamic Stop: {potential.get('downside_reference')}")
+        print(f"Dynamic Stop %: {potential.get('downside_risk_pct')}")
+        print(f"T1: {potential.get('target_1')}")
+        print(f"T2: {potential.get('target_2')}")
+        print(f"T3: {potential.get('target_3')}")
+        print(f"RR_T1: {potential.get('rr_t1')}")
+        print(f"RR_T2: {potential.get('rr_t2')}")
+        print(f"RR_T3: {potential.get('rr_t3')}")
+        print(f"Final entry_rr: {potential.get('entry_rr')}")
+        if rejected:
+            reason=potential.get("unavailable_reason") or "MISSING_POTENTIAL_FIELDS: "+", ".join(missing)
+            print(f"Potential Rejection Reason: {reason}")
+        print("FINAL DECISION")
+        print(f"Decision: {item.get('decision','HOLD')}")
+        print(f"Reason Code: {item.get('reason_code','LEGACY_STRATEGY_DECISION')}")
+        print(f"Reason: {item.get('reason','')}")
         breakdown=item.get("score_breakdown",{})
         if breakdown:
             print("TECHNICAL_PLUS_NEWS SCORE BREAKDOWN")
@@ -281,20 +340,38 @@ def main() -> int:
     openai_key_configured=load_project_environment()
     parser=build_parser()
     args=parser.parse_args(); logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if args.reset_paper and not args.confirm:
+        parser.error("--reset-paper requires explicit --confirm")
+    if args.reset_paper:
+        mode=configured_trading_mode(args.config)
+        if mode != "PAPER":
+            parser.error(f"--reset-paper refused in {mode or 'UNKNOWN'} mode; PAPER mode is required")
     settings=load_settings(args.config,args.capital)
     if not Path(settings.database).is_absolute():
         settings=settings.model_copy(update={"database":str(PROJECT_ROOT/settings.database)})
-    database=Database(":memory:") if (args.diagnose_intelligence or args.diagnose_regime or args.analyze_symbol) else Database(settings.database,read_only=args.status)
+    # Provider-only diagnostics do not need durable application state. Symbol
+    # analysis does: the KAP fundamental provider uses this same database path
+    # for its durable financial cache, so an in-memory composition would hide
+    # the PAPER runtime cache and discard any refreshed periods on exit.
+    database=Database(":memory:") if (args.diagnose_intelligence or args.diagnose_regime) else Database(settings.database,read_only=args.status)
+    analysis_broker_database=None
     try:
-        if args.reset:
-            database.close(); path=Path(settings.database)
-            if path.exists(): path.unlink()
-            print("Paper portfolio reset"); return 0
+        if args.reset_paper:
+            capital=reset_paper_state(database,mode=settings.trading_mode,capital=settings.capital)
+            print(f"PAPER state reset; cash={capital}")
+            return 0
         if args.status:
             print(json.dumps(paper_status(database,settings),indent=2)); return 0
         notifier=SafeNotificationDispatcher([MacOSNotificationProvider(),TelegramNotificationProvider(),EmailNotificationProvider()])
+        # PaperBroker initializes accounting metadata in its database. Keep
+        # single-symbol analysis isolated from PAPER accounting while the
+        # application repositories and KAP cache remain on the real database.
+        broker_database=database
+        if args.analyze_symbol:
+            analysis_broker_database=Database(":memory:")
+            broker_database=analysis_broker_database
         broker=PaperBroker(settings.capital,settings.execution.commission_pct,settings.execution.slippage_pct,
-                           database=database,risk_settings=settings.risk,notifier=notifier,
+                           database=broker_database,risk_settings=settings.risk,notifier=notifier,
                            yahoo_execution_freshness_seconds=settings.market_data.yahoo_execution_freshness_seconds)
         market_status=broker.calendar.status()
         print("\nBIST MARKET STATUS")
@@ -320,12 +397,16 @@ def main() -> int:
         if args.diagnose_regime:
             print_regime_diagnostics(app.diagnose_regime()); return 0
         if args.analyze_symbol:
-            # The analysis runtime itself stays in-memory. Read only the list of
-            # existing paper positions so the summary cannot recommend a duplicate BUY.
+            # Analysis never executes orders, while sharing the PAPER database
+            # keeps the durable KAP cache on the exact same runtime path as
+            # normal PAPER cycles. Read position context through the already
+            # open application connection; the isolated broker cannot see it.
             try:
-                with Database(settings.database,read_only=True) as portfolio_database:
-                    app.diagnostic_existing_positions={row["symbol"] for row in portfolio_database.query("SELECT symbol FROM paper_positions")}
-            except Exception:
+                app.diagnostic_existing_positions={row["symbol"] for row in
+                    database.query("SELECT symbol FROM paper_positions")}
+            except Exception as error:
+                logging.getLogger(__name__).warning(
+                    "Could not read PAPER position context for analysis: %s",type(error).__name__)
                 app.diagnostic_existing_positions=set()
             print_symbol_analysis(app.analyze_symbol(args.analyze_symbol)); return 0
         if args.once or args.dry_run:
@@ -347,6 +428,10 @@ def main() -> int:
         except UnboundLocalError: pass
         return 1
     finally:
+        try:
+            if analysis_broker_database is not None:
+                analysis_broker_database.close()
+        except Exception: pass
         try: database.close()
         except Exception: pass
 

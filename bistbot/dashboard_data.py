@@ -33,8 +33,10 @@ class DashboardDataService:
             closed_positions=self._closed_positions(trades)
             cycle=self._last_cycle(connection); history=self._portfolio_history(connection)
             market_regime=self._market_regime(connection)
+            decisions=self._investment_decisions(connection,cycle.get("decisions",[]) if cycle else [])
             metadata={row["key"]:row["value"] for row in connection.execute(
                 "SELECT key,value FROM metadata WHERE key IN ('paper_cash','paper_initial_capital','paper_realized_pnl')")}
+            controls=self._paper_controls(connection)
         cash=Decimal(metadata.get("paper_cash",str(self.settings.capital)))
         initial=Decimal(metadata.get("paper_initial_capital",str(self.settings.capital)))
         invested=sum((Decimal(str(item["market_value"])) for item in positions),Decimal("0"))
@@ -53,14 +55,93 @@ class DashboardDataService:
             "bot_recorded_equity":float(bot_recorded_equity),
             "last_cycle":cycle.get("timestamp") if cycle else None},"positions":positions,"trades":trades,
             "closed_positions":closed_positions,
-            "cycle":cycle,"decisions":cycle.get("decisions",[]) if cycle else [],"history":history,
+            "cycle":cycle,"decisions":decisions,"history":history,
             "market_regime":market_regime,
             "risk":{"cash_pct":float(cash/equity*100) if equity else 0,"invested_pct":float(invested/equity*100) if equity else 0,
-                "max_open_positions":self.settings.risk.max_open_positions,
+                "max_open_positions":controls["effective_max_open_positions"],
+                "configured_max_open_positions":controls["configured_max_open_positions"],
+                "max_open_positions_override":controls["max_open_positions_override"],
+                "max_open_positions_version":controls["max_open_positions_version"],
+                "cash_version":controls["cash_version"],
                 "min_cash_pct":self.settings.risk.min_cash_pct*100,
                 "daily_loss_limit":self.settings.risk.max_daily_loss_pct*100,
                 "weekly_loss_limit":self.settings.risk.max_weekly_loss_pct*100,
                 "drawdown_limit":self.settings.risk.max_total_drawdown_pct*100}}
+
+    @classmethod
+    def _investment_decisions(cls,connection,decisions) -> list[dict]:
+        """Enrich cycle decisions from optional append-only analysis snapshots.
+
+        Snapshot schemas are deliberately consumed through their JSON payloads so
+        adding provider-specific columns cannot make the read-only dashboard fail.
+        A cycle decision remains authoritative when it already carries a field.
+        """
+        output=[dict(item) for item in decisions if isinstance(item,dict)]
+        by_symbol={item.get("symbol"):item for item in output if item.get("symbol")}
+        for table,key in (("fundamental_snapshots","fundamental"),("fundamental_scores","fundamental"),
+                          ("technical_levels","technical_levels"),
+                          ("potential_assessments","potential")):
+            for snapshot in cls._latest_payloads(connection,table):
+                symbol=snapshot.get("symbol")
+                if not symbol:continue
+                item=by_symbol.setdefault(symbol,{"symbol":symbol})
+                if item not in output:output.append(item)
+                nested=item.get(key)
+                if not isinstance(nested,dict):nested={}
+                # Top-level normalized fields are retained for compatibility with
+                # decision payloads, while the namespaced view drives presentation.
+                merged={**snapshot,**nested}
+                item[key]=merged
+        for item in output:
+            fundamental=item.get("fundamental") if isinstance(item.get("fundamental"),dict) else {}
+            levels=item.get("technical_levels") if isinstance(item.get("technical_levels"),dict) else {}
+            potential=item.get("potential") if isinstance(item.get("potential"),dict) else {}
+            item["fundamental"]={
+                "provider_status":item.get("fundamental_provider_status",fundamental.get("provider_status","UNAVAILABLE")),
+                **fundamental,
+            }
+            item["technical_levels"]={"status":"AVAILABLE" if levels else "UNAVAILABLE",**levels}
+            item["potential"]={"status":"AVAILABLE" if potential else "UNAVAILABLE",**potential}
+        return output
+
+    @staticmethod
+    def _latest_payloads(connection,table: str) -> list[dict]:
+        """Return the latest valid payload per symbol, or no rows for legacy DBs."""
+        try:
+            columns={row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if not {"symbol","payload"}.issubset(columns):return []
+            order="timestamp DESC, id DESC" if {"timestamp","id"}.issubset(columns) else (
+                "timestamp DESC" if "timestamp" in columns else "rowid DESC")
+            rows=connection.execute(f"SELECT * FROM {table} ORDER BY {order}")
+        except (sqlite3.OperationalError,sqlite3.ProgrammingError):return []
+        seen=set(); output=[]
+        for row in rows:
+            if row["symbol"] in seen:continue
+            try:payload=json.loads(row["payload"] or "{}")
+            except (TypeError,ValueError,json.JSONDecodeError):continue
+            if not isinstance(payload,dict):continue
+            persisted={name:row[name] for name in row.keys() if name not in {"id","payload"}}
+            if table=="fundamental_scores" and persisted.get("score") is not None:
+                persisted["fundamental_score"]=persisted["score"]
+            elif table=="potential_assessments" and persisted.get("score") is not None:
+                persisted["potential_score"]=persisted["score"]
+            seen.add(row["symbol"]); output.append({**persisted,**payload})
+        return output
+
+    def _paper_controls(self,connection) -> dict:
+        configured=self.settings.risk.max_open_positions
+        try:
+            rows={row["key"]:row for row in connection.execute(
+                "SELECT key,value,version FROM runtime_settings WHERE key IN "
+                "('paper.max_open_positions','paper.cash.version')")}
+        except (sqlite3.OperationalError,sqlite3.ProgrammingError):rows={}
+        override_row=rows.get("paper.max_open_positions"); cash_version=rows.get("paper.cash.version")
+        try:override=int(override_row["value"]) if override_row else None
+        except (TypeError,ValueError):override=None
+        return {"configured_max_open_positions":configured,"max_open_positions_override":override,
+            "effective_max_open_positions":override if override is not None else configured,
+            "max_open_positions_version":int(override_row["version"]) if override_row else 0,
+            "cash_version":int(cash_version["value"]) if cash_version else 0}
 
     @staticmethod
     def _market_regime(connection) -> dict:
@@ -83,6 +164,7 @@ class DashboardDataService:
             entry_score=connection.execute("SELECT final_score FROM paper_orders WHERE symbol=? AND side='BUY' AND status='FILLED' ORDER BY timestamp DESC LIMIT 1",(symbol,)).fetchone()
             latest_score=connection.execute("SELECT score FROM technical_signals WHERE symbol=? ORDER BY timestamp DESC LIMIT 1",(symbol,)).fetchone()
             stored_score=row["current_score"] if "current_score" in columns else None
+            persisted_stop=row["stop_price"] if "stop_price" in columns else None
             pnl=(last-average)*quantity; market_value=last*quantity
             output.append({"symbol":symbol,"quantity":quantity,"average_entry":float(average),"last_price":float(last),
                 "market_value":float(market_value),"unrealized_pnl":float(pnl),
@@ -90,7 +172,8 @@ class DashboardDataService:
                 "entry_score":entry_score[0] if entry_score else None,
                 "current_score":None if stale else (stored_score if stored_score is not None else (latest_score[0] if latest_score else None)),
                 "last_known_score":stored_score if stored_score is not None else (latest_score[0] if latest_score else None),
-                "stop_price":float(average*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))),
+                "stop_price":float(Decimal(persisted_stop) if persisted_stop is not None else
+                                   average*(Decimal("1")-Decimal(str(self.settings.risk.default_stop_loss_pct)))),
                 "take_profit_price":float(average*(Decimal("1")+Decimal(str(self.settings.risk.default_take_profit_pct)))),
                 "trailing_stop":float(high*(Decimal("1")-Decimal(str(self.settings.risk.default_trailing_stop_pct)))),
                 "highest_price":float(high),"opened_at":row["opened_at"],"updated_at":row["updated_at"],
