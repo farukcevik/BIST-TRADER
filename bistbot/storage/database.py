@@ -20,7 +20,11 @@ class Database:
     def _migrate(self) -> None:
         columns={row["name"] for row in self.connection.execute("PRAGMA table_info(paper_positions)")}
         additions={"current_score":"REAL","data_timestamp":"TEXT",
-                   "position_status":"TEXT NOT NULL DEFAULT 'UNKNOWN'"}
+                   "position_status":"TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                   "initial_quantity":"INTEGER","target_1":"TEXT","target_2":"TEXT",
+                   "target_3":"TEXT","stop_price":"TEXT",
+                   "target_1_hit":"INTEGER NOT NULL DEFAULT 0",
+                   "target_2_hit":"INTEGER NOT NULL DEFAULT 0"}
         for name,declaration in additions.items():
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE paper_positions ADD COLUMN {name} {declaration}")
