@@ -22,7 +22,9 @@ DIAGNOSTICS={
         "reason":"final_score 76.4 below buy_threshold 78","news_status":"NO_NEWS",
         "llm_status":"NOT_REQUIRED","signal_mode":"TECHNICAL_ONLY",
         "fundamental":{"fundamental_score":100,"effective_score":48.73,"coverage":38.46,
-            "confidence":49.42}}],
+            "confidence":49.42,"score_breakdown":{"profile":"GENERAL","metric_values":{
+                "revenue_yoy":12.5,"gross_margin":.31,"net_margin":None,"roe":.18,
+                "ocf_net_income":1.1,"equity_assets":.42,"asset_yoy":8.4}}}}],
     "risk":[{"symbol":"BBB","proposed_position_value":"25000.00","proposed_quantity":250,
         "stop_price":"96.00","maximum_allowed_risk":"1000.00","risk_decision":"REDUCE_SIZE",
         "reason_code":"MAX_POSITION_SIZE","reason":"Requested quantity reduced"}],
@@ -48,6 +50,9 @@ def test_verbose_formatter_prints_scores_hold_reason_and_risk(capsys):
     assert "TOP 10 INTELLIGENCE / LLM CANDIDATES" in output and "priced_in_probability: 45" in output
     assert "raw_score: 100" in output and "effective_score: 48.73" in output
     assert "coverage: 38.46" in output and "confidence: 49.42" in output
+    assert "Profile: GENERAL" in output and "Revenue YoY: 12.5" in output
+    assert "Net Margin: UNKNOWN" in output and "OCF / Net Income: 1.1" in output
+    assert "EBITDA Growth:" not in output and "Net Debt / EBITDA:" not in output
     assert "HOLD REASON" in output and "final_score 76.4 below buy_threshold 78" in output
     assert "RISK DECISION" in output and "reason_code: MAX_POSITION_SIZE" in output
 
@@ -100,6 +105,22 @@ def test_symbol_analysis_prints_calibrated_fundamental_diagnostics(capsys):
     assert '"effective_score": 43.61' in output
     assert '"coverage": 38.46' in output
     assert '"confidence": 49.42' in output
+
+
+def test_verbose_formatter_prints_bank_profile_metrics(capsys):
+    diagnostics={"candidates":[{"symbol":"BANK.IS","decision":"HOLD","final_score":70,
+        "reason":"fixture","news_status":"NO_NEWS","llm_status":"NOT_REQUIRED",
+        "signal_mode":"STAGED_INVESTMENT","fundamental":{"fundamental_score":72,
+            "effective_score":61,"coverage":85.71,"confidence":76,
+            "score_breakdown":{"profile":"BANK","metric_values":{"net_income_yoy":9,
+                "net_interest_income_yoy":11,"loan_growth":14,"deposit_growth":None,
+                "roe":.16,"roa":.02,"equity_assets":.12}}}}]}
+
+    cli.print_verbose_diagnostics(diagnostics); output=capsys.readouterr().out
+
+    assert "Profile: BANK" in output and "Net Interest Income YoY: 11" in output
+    assert "Loan Growth: 14" in output and "Deposit Growth: UNKNOWN" in output
+    assert "ROE: 0.16" in output and "ROA: 0.02" in output and "Equity / Assets: 0.12" in output
 
 
 def test_cycle_summary_explains_raw_buy_blocked_by_existing_position(capsys):

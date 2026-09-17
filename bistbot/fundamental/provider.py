@@ -9,6 +9,7 @@ from email.utils import parsedate_to_datetime
 import sqlite3
 import threading
 import time
+import random
 from typing import Any
 import urllib.parse
 import urllib.request
@@ -23,15 +24,16 @@ from .models import FinancialPeriod, FundamentalProviderStatus, FundamentalSnaps
 
 
 class _SharedRateLimiter:
-    def __init__(self,interval,sleeper,clock):
-        self.interval=interval;self.sleeper=sleeper;self.clock=clock
+    def __init__(self,minimum,maximum,sleeper,clock,jitter):
+        self.minimum=minimum;self.maximum=maximum;self.sleeper=sleeper;self.clock=clock;self.jitter=jitter
         self.lock=threading.Lock();self.next_allowed=0.0
+        self.request_lock=threading.Lock()
     def wait(self):
         # Keep the reservation and request start atomic across provider instances.
         with self.lock:
             delay=max(0.0,self.next_allowed-self.clock())
             if delay:self.sleeper(delay)
-            self.next_allowed=self.clock()+self.interval
+            self.next_allowed=self.clock()+self.jitter(self.minimum,self.maximum)
     def defer(self,delay):
         # Retry-After is a server-wide cooldown, not a per-symbol delay.
         with self.lock:
@@ -41,10 +43,10 @@ class _SharedRateLimiter:
 
 _LIMITERS_LOCK=threading.Lock()
 _LIMITERS: dict[tuple[Any,...],_SharedRateLimiter]={}
-def _shared_limiter(opener,sleeper,clock,interval):
-    key=(opener,sleeper,clock,float(interval))
+def _shared_limiter(opener,sleeper,clock,minimum,maximum,jitter):
+    key=(opener,sleeper,clock,float(minimum),float(maximum),jitter)
     with _LIMITERS_LOCK:
-        return _LIMITERS.setdefault(key,_SharedRateLimiter(interval,sleeper,clock))
+        return _LIMITERS.setdefault(key,_SharedRateLimiter(minimum,maximum,sleeper,clock,jitter))
 
 
 class FundamentalDataProvider(ABC):
@@ -77,7 +79,8 @@ class KapFundamentalProvider(FundamentalDataProvider):
                  refresh_interval: timedelta = timedelta(hours=6),
                  failure_backoff: timedelta = timedelta(minutes=10),
                  max_cache_age: timedelta = timedelta(days=45),
-                 min_request_interval: float = .35, sleeper=time.sleep,
+                 min_request_interval: float = 1.5, max_request_interval: float | None = None,
+                 sleeper=time.sleep, jitter: Callable[[float,float],float] = random.uniform,
                  now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  monotonic: Callable[[], float] = time.monotonic,
                  price_resolver: Callable[[str], float | None] | None = None):
@@ -85,12 +88,14 @@ class KapFundamentalProvider(FundamentalDataProvider):
         self.max_attempts=max_attempts; self.refresh_interval=refresh_interval
         self.failure_backoff=failure_backoff
         self.max_cache_age=max_cache_age
-        self.min_request_interval=min_request_interval; self.sleeper=sleeper; self.now=now
+        max_request_interval=(2.5 if min_request_interval==1.5 else min_request_interval) if max_request_interval is None else max_request_interval
+        if max_request_interval < min_request_interval:raise ValueError("max request interval must be >= minimum")
+        self.min_request_interval=min_request_interval; self.max_request_interval=max_request_interval; self.sleeper=sleeper; self.now=now
         self.monotonic=monotonic
         self.price_resolver=price_resolver or self._cached_market_price
         # The limiter is deliberately shared by all live provider instances. Its
         # dependency-based scope keeps separately injected test clients isolated.
-        self._rate_limiter=_shared_limiter(opener,sleeper,monotonic,min_request_interval)
+        self._rate_limiter=_shared_limiter(opener,sleeper,monotonic,min_request_interval,max_request_interval,jitter)
         self._member_catalog: list[dict[str,Any]]|None=None
 
     def get_snapshot(self, symbol: str, as_of: datetime) -> FundamentalSnapshot:
@@ -158,6 +163,7 @@ class KapFundamentalProvider(FundamentalDataProvider):
         materially_complete=complete_history and all(all(getattr(p,name).available for name in required) for p in periods[:8])
         status=(FundamentalProviderStatus.UNAVAILABLE if not useful or stale else
                 FundamentalProviderStatus.AVAILABLE if materially_complete else FundamentalProviderStatus.PARTIAL)
+        company_type,company_type_status,company_type_source=self._member_company_profile(ticker)
         return FundamentalSnapshot(symbol=symbol,as_of=as_of,source=self.SOURCE,
             provider_status=status,periods=periods[:12],audit_metadata={
                 "official_source":"https://www.kap.org.tr", "cache":"sqlite",
@@ -167,7 +173,9 @@ class KapFundamentalProvider(FundamentalDataProvider):
                 "latest_period_end":periods[0].period_end.isoformat() if periods else None,
                 "currency":periods[0].currency if periods else None,"unit":periods[0].unit if periods else None,
                 "consolidation_scope":periods[0].consolidated if periods else None,
-                "consolidation_policy":"prefer_consolidated","missing_values":"None"})
+                "consolidation_policy":"prefer_consolidated","missing_values":"None",
+                "company_type":company_type,"company_type_status":company_type_status,
+                "company_type_source":company_type_source})
 
     def _refresh_due(self,ticker: str,as_of: datetime) -> bool:
         with sqlite3.connect(self.database_path) as db:
@@ -184,23 +192,24 @@ class KapFundamentalProvider(FundamentalDataProvider):
         body=json.dumps(post_data).encode() if post_data is not None else None
         request=urllib.request.Request(url,data=body,method="POST" if body else "GET",headers={"Accept":"application/json,text/html","Content-Type":"application/json","User-Agent":"BISTBOT/1.0 (+official KAP fundamentals)","Referer":"https://www.kap.org.tr/tr/bildirim-sorgu"})
         for attempt in range(self.max_attempts):
-            try:
-                self._rate_limiter.wait()
-                with self.opener(request,timeout=self.timeout_seconds) as response:
-                    raw=response.read(); status=getattr(response,"status",200)
-                    retry_after=_retry_after(getattr(response,"headers",None),now=self.now)
-                if status != 200: raise _KapHttpError(status,retry_after)
-                if len(raw)>20_000_000: raise ValueError("KAP response exceeds safety limit")
-                decoded=raw.decode("utf-8")
-                return json.loads(decoded) if json_response else decoded
-            except Exception as exc:
-                retry_after=_retry_after(getattr(exc,"headers",None),now=self.now)
-                if isinstance(exc,_KapHttpError):retry_after=exc.retry_after
-                delay=retry_after if retry_after is not None else min(.5*2**attempt,4)
-                if retry_after is not None:
+            with self._rate_limiter.request_lock:
+                try:
+                    self._rate_limiter.wait()
+                    with self.opener(request,timeout=self.timeout_seconds) as response:
+                        raw=response.read(); status=getattr(response,"status",200)
+                        retry_after=_retry_after(getattr(response,"headers",None),now=self.now)
+                    if status != 200: raise _KapHttpError(status,retry_after)
+                    if len(raw)>20_000_000: raise ValueError("KAP response exceeds safety limit")
+                    decoded=raw.decode("utf-8")
+                    return json.loads(decoded) if json_response else decoded
+                except Exception as exc:
+                    retry_after=_retry_after(getattr(exc,"headers",None),now=self.now)
+                    if isinstance(exc,_KapHttpError):retry_after=exc.retry_after
+                    delay=retry_after if retry_after is not None else min(.5*2**attempt,8)
+                    # Register the server-wide cooldown before another serialized
+                    # request can acquire the request lock.
                     self._rate_limiter.defer(delay)
-                if attempt+1>=self.max_attempts:raise
-                if retry_after is None:self._rate_limiter.defer(delay)
+                    if attempt+1>=self.max_attempts:raise
 
     def _discover(self,oid,start,end):
         criteria={"fromDate":start.isoformat(),"toDate":end.isoformat(),"memberType":"IGS",
@@ -247,7 +256,8 @@ class KapFundamentalProvider(FundamentalDataProvider):
                     for index,header in enumerate(headers):
                         if header in columns and index<len(row):column_meta[header][key]=row[index]
                     continue
-                alias=next((_account_alias(cell) for cell in labels if _account_alias(cell)),None)
+                # Hierarchy columns run broad-to-specific; select the leaf account.
+                alias=next((_account_alias(cell) for cell in reversed(labels) if _account_alias(cell)),None)
                 if not alias:continue
                 for index,header in enumerate(headers):
                     if header in columns and index<len(row):columns[header][alias]=_number(row[index])
@@ -269,7 +279,7 @@ class KapFundamentalProvider(FundamentalDataProvider):
                 "consolidated":column_consolidated,"periodStart":start,"periodEnd":end.isoformat(),"facts":facts}
                 )
         records_by_period: dict[tuple[Any,...],dict[str,Any]]={}
-        flow_names={"revenue","gross_profit","operating_profit","ebitda","net_income","operating_cash_flow","investing_cash_flow","capex","free_cash_flow"}
+        flow_names={"revenue","gross_profit","operating_profit","ebitda","net_income","net_interest_income","operating_cash_flow","investing_cash_flow","capex","free_cash_flow"}
         for fragment in fragments:
             period_key=(fragment["periodEnd"],fragment["consolidated"],fragment["currency"],fragment["unit"])
             merged=records_by_period.setdefault(period_key,{**fragment,"facts":{}})
@@ -284,11 +294,11 @@ class KapFundamentalProvider(FundamentalDataProvider):
         with sqlite3.connect(self.database_path) as db:return {row[0] for row in db.execute("SELECT filing_id FROM kap_processed_disclosures WHERE symbol=?",(ticker,))}
     def _member_identity(self,ticker,checked):
         with sqlite3.connect(self.database_path) as db:
-            row=db.execute("SELECT mkk_member_oid,resolved_at FROM kap_member_cache WHERE symbol=?",(ticker,)).fetchone()
+            row=db.execute("SELECT mkk_member_oid,resolved_at,company_type FROM kap_member_cache WHERE symbol=?",(ticker,)).fetchone()
         if row:
             resolved=datetime.fromisoformat(row[1]);reference=checked if checked.tzinfo else checked.replace(tzinfo=timezone.utc)
             if resolved.tzinfo is None:resolved=resolved.replace(tzinfo=timezone.utc)
-            if reference-resolved<timedelta(days=30):return row[0]
+            if reference-resolved<timedelta(days=30) and row[2] in {"GENERAL","BANK"}:return row[0]
         payload=self._json(self.MEMBER_URL.format(ticker=urllib.parse.quote(ticker)))
         oid=_member_oid(payload,ticker)
         candidates=_member_candidates(payload)
@@ -304,9 +314,22 @@ class KapFundamentalProvider(FundamentalDataProvider):
         with sqlite3.connect(self.database_path) as db:
             db.execute("PRAGMA busy_timeout=5000")
             shares=_validated_shares(candidate)
-            db.execute("INSERT OR REPLACE INTO kap_member_cache(symbol,mkk_member_oid,company_code,permalink,resolved_at,outstanding_shares) VALUES(?,?,?,?,?,?)",
-                (ticker,oid,_first(candidate,"companyCode"),_first(candidate,"permaLink"),checked.isoformat(),shares))
+            company_type=_company_type(candidate)
+            db.execute("INSERT OR REPLACE INTO kap_member_cache(symbol,mkk_member_oid,company_code,permalink,resolved_at,outstanding_shares,company_type) VALUES(?,?,?,?,?,?,?)",
+                (ticker,oid,_first(candidate,"companyCode"),_first(candidate,"permaLink"),checked.isoformat(),shares,company_type))
         return oid
+
+    def _member_company_type(self,ticker):
+        return self._member_company_profile(ticker)[0]
+
+    def _member_company_profile(self,ticker):
+        with sqlite3.connect(self.database_path) as db:
+            row=db.execute("SELECT company_type,company_code,permalink FROM kap_member_cache WHERE symbol=?",(ticker,)).fetchone()
+        if row and row[0] in {"GENERAL","BANK"}:return str(row[0]),"CONFIRMED","KAP_MEMBER_CACHE"
+        if row:
+            inferred=_company_type({"companyCode":row[1],"permalink":row[2]})
+            if inferred=="BANK":return inferred,"INFERRED","KAP_PERMALINK"
+        return "GENERAL","PROVISIONAL","DEFAULT"
 
     def _member_shares(self,ticker):
         with sqlite3.connect(self.database_path) as db:row=db.execute("SELECT outstanding_shares FROM kap_member_cache WHERE symbol=?",(ticker,)).fetchone()
@@ -326,9 +349,7 @@ class KapFundamentalProvider(FundamentalDataProvider):
                         (ticker,filing_id,published.isoformat(),checked.isoformat(),"PARSED",url))
                 rows=db.execute("SELECT payload FROM kap_raw_filing_periods WHERE symbol=? ORDER BY published_at DESC",(ticker,)).fetchall()
                 raw=[FinancialPeriod.model_validate_json(row[0]) for row in rows]
-                raw.sort(key=lambda p:(p.period_end.date(),bool(p.consolidated),p.published_at or p.period_end),reverse=True);chosen={}
-                for period in raw:chosen.setdefault(period.period_end.date(),period)
-                normalized=_quarterize(list(chosen.values()))[:12]
+                normalized=_normalize_revisions(raw)[:12]
                 db.execute("DELETE FROM kap_financial_cache WHERE symbol=?",(ticker,))
                 for period in normalized:self._insert_cache(db,ticker,period,checked)
                 latest=max(batches,key=lambda item:item[1])[0]
@@ -432,11 +453,22 @@ class KapFundamentalProvider(FundamentalDataProvider):
     def _load(self,ticker: str,as_of: datetime|None=None) -> list[FinancialPeriod]:
         with sqlite3.connect(self.database_path) as db:
             rows=db.execute("SELECT payload FROM kap_financial_cache WHERE symbol=? ORDER BY period_end DESC,consolidated DESC",(ticker,)).fetchall()
-        periods=[FinancialPeriod.model_validate_json(row[0]) for row in rows]
+            raw_rows=db.execute("SELECT payload FROM kap_raw_filing_periods WHERE symbol=? ORDER BY published_at DESC",(ticker,)).fetchall()
+        # Prefer the durable raw-period cache. Later filings often carry a
+        # comparative balance-sheet column with no flow facts; coalescing the
+        # revisions preserves the original annual filing's flow observations.
         if as_of is not None:
             cutoff=_utc(as_of)
+            raw_periods=[FinancialPeriod.model_validate_json(row[0]) for row in raw_rows]
+            raw_periods=[period for period in raw_periods
+                if period.published_at is None or _utc(period.published_at)<=cutoff]
+            periods=(_normalize_revisions(raw_periods) if raw_rows else
+                [FinancialPeriod.model_validate_json(row[0]) for row in rows])
             periods=[period for period in periods
                 if period.published_at is None or _utc(period.published_at)<=cutoff]
+        else:
+            periods=(_normalize_revisions([FinancialPeriod.model_validate_json(row[0]) for row in raw_rows])
+                if raw_rows else [FinancialPeriod.model_validate_json(row[0]) for row in rows])
         return periods[:12]
     def _cache_audit(self,ticker):
         with sqlite3.connect(self.database_path) as db:
@@ -478,6 +510,9 @@ _ALIASES={
  "revenue":("revenue","sales","ifrs-full_Revenue"),"gross_profit":("grossprofit","gross_profit","ifrs-full_GrossProfit"),
  "operating_profit":("operatingprofit","operating_profit","kap-fr_OperatingProfitLoss"),"ebitda":("ebitda",),
  "net_income":("netincome","net_income","profitloss","ifrs-full_ProfitLoss"),
+ "net_interest_income":("netinterestincome","net_interest_income","interestincomeexpenseNet","bdk-netinterestincome"),
+ "loans":("loans","loansandreceivables","loansandadvancestocustomers","credits"),
+ "deposits":("deposits","customerdeposits","depositsfromcustomers"),
  "operating_cash_flow":("operatingcashflow","operating_cash_flow","ifrs-full_CashFlowsFromUsedInOperatingActivities"),
  "investing_cash_flow":("investingcashflow","investing_cash_flow","ifrs-full_CashFlowsFromUsedInInvestingActivities"),
  "capex":("capex","purchaseofpropertyplantandequipment","ifrs-full_PurchaseOfPropertyPlantAndEquipment"),
@@ -494,6 +529,7 @@ _ALIASES={
 
 _LABELS={
  "hasılat":"revenue","hasilat":"revenue","revenue":"revenue","satış gelirleri":"revenue",
+ "satışlar":"revenue","mal ve hizmet satışlarından elde edilen gelirler":"revenue",
  "brüt kar":"gross_profit","brüt kâr":"gross_profit","gross profit":"gross_profit",
  "brüt kâr (zarar)":"gross_profit","brüt kar (zarar)":"gross_profit",
  "faaliyet karı":"operating_profit","faaliyet kârı":"operating_profit","operating profit":"operating_profit",
@@ -501,14 +537,21 @@ _LABELS={
  "favök":"ebitda","favok":"ebitda","ebitda":"ebitda","dönem karı":"net_income","dönem kârı":"net_income",
  "net dönem karı":"net_income","net dönem kârı":"net_income","net income":"net_income",
  "net dönem kârı (zararı)":"net_income","net dönem karı (zararı)":"net_income",
+ "dönem net kârı (zararı)":"net_income","dönem net karı (zararı)":"net_income",
+ "net faiz geliri":"net_interest_income","net interest income":"net_interest_income",
+ "krediler":"loans","krediler ve alacaklar":"loans","loans and receivables":"loans",
+ "mevduat":"deposits","müşteri mevduatları":"deposits","customer deposits":"deposits",
  "işletme faaliyetlerinden nakit akışları":"operating_cash_flow","operating cash flow":"operating_cash_flow",
+ "işletme faaliyetlerinden elde edilen nakit akışları":"operating_cash_flow",
+ "faaliyetlerden elde edilen nakit akışları":"operating_cash_flow",
  "yatırım faaliyetlerinden nakit akışları":"investing_cash_flow","investing cash flow":"investing_cash_flow",
  "maddi duran varlık alımları":"capex","maddi duran varlık satın alımları":"capex","capital expenditures":"capex",
  "nakit ve nakit benzerleri":"cash_and_equivalents","cash and cash equivalents":"cash_and_equivalents",
  "kısa vadeli borçlanmalar":"short_term_financial_debt","short-term borrowings":"short_term_financial_debt",
  "uzun vadeli borçlanmalar":"long_term_financial_debt","long-term borrowings":"long_term_financial_debt",
  "toplam varlıklar":"total_assets","total assets":"total_assets","toplam yükümlülükler":"total_liabilities",
- "total liabilities":"total_liabilities","özkaynaklar":"equity","toplam özkaynaklar":"equity","özkaynak":"equity","equity":"equity"}
+ "total liabilities":"total_liabilities","özkaynaklar":"equity","toplam özkaynaklar":"equity","özkaynak":"equity","equity":"equity",
+ "ana ortaklığa ait özkaynaklar":"equity","shareholders equity":"equity"}
 
 class _TableParser(HTMLParser):
     # A live KAP financial report contains many tiny taxonomy/layout tables.
@@ -667,6 +710,13 @@ def _validated_shares(candidate):
     if capital_currency not in {"TRY","TL"} or nominal_currency not in {"TRY","TL"} or unit not in {"SHARE","ADET"}:return None
     shares=paid/nominal
     return shares if shares.is_integer() else None
+def _company_type(candidate):
+    """Use KAP member metadata only; an unknown classification stays GENERAL."""
+    if not isinstance(candidate,dict):return "GENERAL"
+    metadata=" ".join(str(_first(candidate,key) or "") for key in
+        ("companyType","memberTypeName","mainSector","sector","subSector","companyTitle","title","permalink"))
+    folded=_fold_label(metadata)
+    return "BANK" if any(token in folded for token in ("banka","bankasi","bankası","bank")) else "GENERAL"
 def _date(value):
     if not value:return None
     if isinstance(value,datetime):return value
@@ -733,9 +783,38 @@ def _ratio(a,b,source): return _metric_value(a.value/b.value,source) if a.value 
 def _ttm(periods,name):
     values=[getattr(p,name).value for p in periods[:4]]
     return sum(values) if len(values)==4 and all(v is not None for v in values) else None
+def _normalize_revisions(periods):
+    """Select one coherent statement per period; never synthesize across filings."""
+    grouped={}
+    for period in periods:grouped.setdefault(period.period_end.date(),[]).append(period)
+    merged=[]
+    for revisions in grouped.values():
+        if any(period.consolidated is True for period in revisions):
+            revisions=[period for period in revisions if period.consolidated is True]
+        # A full-period statement is more coherent than a later comparative
+        # instant column. Within the same basis, publication time resolves revisions.
+        revisions.sort(key=lambda p:((p.period_end-p.period_start).days>=300 if p.period_start else False,
+            sum(getattr(p,name).value is not None for name in _ALIASES),p.published_at or p.period_end),reverse=True)
+        period=revisions[0].model_copy(deep=True)
+        # Legacy hierarchy parsing could map the parent Assets label to Equity.
+        # The accounting identity recovers equity only when liabilities are known.
+        if (period.total_assets.value is not None and period.equity.value==period.total_assets.value):
+            if period.total_liabilities.value is not None:
+                period.equity=_metric_value(period.total_assets.value-period.total_liabilities.value,
+                    "derived:assets_minus_liabilities")
+            else:
+                # A legacy hierarchy collision copied the parent Assets row into
+                # Equity. Without liabilities the true equity cannot be recovered.
+                period.equity=Metric()
+        for target,numerator in (("gross_margin","gross_profit"),("operating_margin","operating_profit"),
+                                  ("ebitda_margin","ebitda"),("net_margin","net_income")):
+            if getattr(period,target).value is None:
+                setattr(period,target,_ratio(getattr(period,numerator),period.revenue,f"derived:{target}"))
+        merged.append(period)
+    return _quarterize(merged)
 def _quarterize(periods):
     """Turn KAP year-to-date flow statements into discrete quarters when identifiable."""
-    flows=("revenue","gross_profit","operating_profit","ebitda","net_income","operating_cash_flow","investing_cash_flow","capex","free_cash_flow")
+    flows=("revenue","gross_profit","operating_profit","ebitda","net_income","net_interest_income","operating_cash_flow","investing_cash_flow","capex","free_cash_flow")
     by_year={}
     for period in periods:by_year.setdefault(period.period_end.year,[]).append(period)
     for group in by_year.values():

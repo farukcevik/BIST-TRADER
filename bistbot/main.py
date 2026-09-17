@@ -143,6 +143,54 @@ def print_symbol_analysis(result: dict) -> None:
     print("\nSIMULATED / NO EXECUTION")
 
 
+_FUNDAMENTAL_PROFILE_METRICS={
+    "GENERAL":(
+        ("revenue_yoy","Revenue YoY","yoy_revenue_growth"),
+        ("gross_margin","Gross Margin","gross_margin"),
+        ("net_margin","Net Margin","net_margin"),
+        ("roe","ROE","roe"),
+        ("ocf_net_income","OCF / Net Income","operating_cash_flow_vs_net_income"),
+        ("equity_assets","Equity / Assets","equity_assets"),
+        ("asset_yoy","Asset YoY","yoy_asset_growth"),
+    ),
+    "BANK":(
+        ("net_income_yoy","Net Income YoY","yoy_net_income_growth"),
+        ("net_interest_income_yoy","Net Interest Income YoY","yoy_net_interest_income_growth"),
+        ("loan_growth","Loan Growth","yoy_loan_growth"),
+        ("deposit_growth","Deposit Growth","yoy_deposit_growth"),
+        ("roe","ROE","roe"),
+        ("roa","ROA","roa"),
+        ("equity_assets","Equity / Assets","equity_assets"),
+    ),
+}
+
+
+def _fundamental_metric_value(fundamental: dict,metric: str,derived_name: str):
+    breakdown=fundamental.get("score_breakdown",{})
+    metric_values=breakdown.get("metric_values",{}) if isinstance(breakdown,dict) else {}
+    value=metric_values.get(metric) if isinstance(metric_values,dict) else None
+    if isinstance(value,dict): value=value.get("value") if value.get("available",value.get("value") is not None) else None
+    if value is not None:return value
+    derived=fundamental.get("derived_metrics",{})
+    value=derived.get(derived_name) if isinstance(derived,dict) else None
+    if isinstance(value,dict):return value.get("value") if value.get("available",value.get("value") is not None) else None
+    return value
+
+
+def _print_fundamental_v2(fundamental: dict) -> None:
+    breakdown=fundamental.get("score_breakdown",{})
+    profile=breakdown.get("profile","GENERAL") if isinstance(breakdown,dict) else "GENERAL"
+    if profile not in _FUNDAMENTAL_PROFILE_METRICS:profile="GENERAL"
+    print(f"Profile: {profile}")
+    for metric,label,derived_name in _FUNDAMENTAL_PROFILE_METRICS[profile]:
+        value=_fundamental_metric_value(fundamental,metric,derived_name)
+        print(f"{label}: {'UNKNOWN' if value is None else value}")
+    print(f"raw_score: {fundamental.get('fundamental_score')}")
+    print(f"coverage: {fundamental.get('coverage',0)}")
+    print(f"confidence: {fundamental.get('confidence',0)}")
+    print(f"effective_score: {fundamental.get('effective_score')}")
+
+
 def paper_status(database: Database,settings) -> dict:
     cash=Decimal(database.query("SELECT value FROM metadata WHERE key='paper_cash'")[0]["value"]); positions={}; warnings=[]
     now=datetime.now(timezone.utc)
@@ -226,17 +274,7 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
         print(f"news_status: {item['news_status']}\nllm_status: {item['llm_status']}\nsignal_mode: {item['signal_mode']}")
         fundamental=item.get("fundamental") if isinstance(item.get("fundamental"),dict) else {}
         print("FUNDAMENTAL ANALYSIS")
-        print(f"Revenue Growth: {fundamental.get('revenue_growth','UNKNOWN')}")
-        print(f"EBITDA Growth: {fundamental.get('ebitda_growth','UNKNOWN')}")
-        print(f"Net Income Growth: {fundamental.get('net_income_growth','UNKNOWN')}")
-        breakdown=fundamental.get("score_breakdown",{}) if isinstance(fundamental.get("score_breakdown"),dict) else {}
-        print(f"Cash Flow Quality: {breakdown.get('cash_flow_quality_score','UNKNOWN')}")
-        print(f"Net Debt / EBITDA: {fundamental.get('net_debt_ebitda','UNKNOWN')}")
-        print(f"Valuation: {fundamental.get('valuation_status','UNKNOWN')}")
-        print(f"raw_score: {fundamental.get('fundamental_score')}")
-        print(f"effective_score: {fundamental.get('effective_score')}")
-        print(f"coverage: {fundamental.get('coverage',0)}")
-        print(f"confidence: {fundamental.get('confidence',0)}")
+        _print_fundamental_v2(fundamental)
         print(f"Red Flags: {fundamental.get('red_flags',[])}")
         levels=item.get("technical_levels") if isinstance(item.get("technical_levels"),dict) else {}
         print("TECHNICAL LEVELS")

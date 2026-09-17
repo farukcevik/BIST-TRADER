@@ -52,6 +52,9 @@ class FinancialPeriod(BaseModel):
     operating_profit: Metric = Field(default_factory=Metric)
     ebitda: Metric = Field(default_factory=Metric)
     net_income: Metric = Field(default_factory=Metric)
+    net_interest_income: Metric = Field(default_factory=Metric)
+    loans: Metric = Field(default_factory=Metric)
+    deposits: Metric = Field(default_factory=Metric)
     operating_cash_flow: Metric = Field(default_factory=Metric)
     investing_cash_flow: Metric = Field(default_factory=Metric)
     capex: Metric = Field(default_factory=Metric)
@@ -111,6 +114,6 @@ class FundamentalAssessment(BaseModel):
     missing_metrics: list[str] = Field(default_factory=list)
     red_flags: list[RedFlag] = Field(default_factory=list)
     positive_factors: list[str] = Field(default_factory=list)
-    score_breakdown: dict[str, float | None | dict[str, float]] = Field(default_factory=dict)
+    score_breakdown: dict[str, object] = Field(default_factory=dict)
     derived_metrics: dict[str, Metric] = Field(default_factory=dict)
     blocks_entry: bool = False

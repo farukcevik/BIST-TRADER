@@ -35,6 +35,8 @@ class Database:
         kap_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(kap_member_cache)")}
         if "outstanding_shares" not in kap_columns:
             self.connection.execute("ALTER TABLE kap_member_cache ADD COLUMN outstanding_shares REAL")
+        if "company_type" not in kap_columns:
+            self.connection.execute("ALTER TABLE kap_member_cache ADD COLUMN company_type TEXT")
         self.connection.commit()
 
     def execute(self, sql: str, parameters: Iterable[Any] = ()) -> sqlite3.Cursor:

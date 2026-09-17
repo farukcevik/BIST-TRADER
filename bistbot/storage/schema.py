@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS kap_financial_cache(symbol TEXT NOT NULL, period_end 
 CREATE TABLE IF NOT EXISTS kap_fundamental_refresh(symbol TEXT PRIMARY KEY, last_checked_at TEXT NOT NULL, latest_filing_id TEXT, last_success_at TEXT, error TEXT);
 CREATE TABLE IF NOT EXISTS kap_processed_disclosures(symbol TEXT NOT NULL,filing_id TEXT NOT NULL,published_at TEXT,processed_at TEXT NOT NULL,status TEXT NOT NULL,source_url TEXT NOT NULL,PRIMARY KEY(symbol,filing_id));
 CREATE TABLE IF NOT EXISTS kap_raw_filing_periods(symbol TEXT NOT NULL,filing_id TEXT NOT NULL,period_end TEXT NOT NULL,consolidated INTEGER NOT NULL,published_at TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(symbol,filing_id,period_end,consolidated));
-CREATE TABLE IF NOT EXISTS kap_member_cache(symbol TEXT PRIMARY KEY,mkk_member_oid TEXT NOT NULL,company_code TEXT,permalink TEXT,resolved_at TEXT NOT NULL,outstanding_shares REAL);
+CREATE TABLE IF NOT EXISTS kap_member_cache(symbol TEXT PRIMARY KEY,mkk_member_oid TEXT NOT NULL,company_code TEXT,permalink TEXT,resolved_at TEXT NOT NULL,outstanding_shares REAL,company_type TEXT CHECK(company_type IN ('GENERAL','BANK')));
 CREATE TABLE IF NOT EXISTS technical_levels(id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, symbol TEXT NOT NULL, confidence REAL NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS potential_assessments(id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, symbol TEXT NOT NULL, score REAL, confidence REAL NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS news_items(id INTEGER PRIMARY KEY, source_id TEXT, source TEXT, url TEXT, timestamp TEXT, title TEXT, body TEXT, symbol TEXT, relevance REAL, content_hash TEXT UNIQUE);

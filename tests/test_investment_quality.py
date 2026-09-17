@@ -49,7 +49,7 @@ def test_fundamental_score_renormalizes_available_components_and_flags_negative_
         provider_status=FundamentalProviderStatus.PARTIAL,periods=periods))
     assert result.fundamental_score is not None
     assert result.effective_score is not None and result.effective_score < result.fundamental_score
-    assert result.coverage == pytest.approx(len(result.available_metrics) / 26 * 100, abs=1e-4)
+    assert result.coverage == pytest.approx(len(result.available_metrics) / 7 * 100, abs=1e-4)
     assert "valuation_score" not in result.score_breakdown["renormalized_weights"]
     assert result.blocks_entry and any(flag.code=="NEGATIVE_EQUITY" for flag in result.red_flags)
     assert result.derived_metrics["yoy_revenue_growth"].available
@@ -69,12 +69,11 @@ def test_effective_score_calibrates_raw_score_without_scoring_unknown_as_zero():
     assert result.missing_metrics
 
 
-def test_positive_equity_alone_is_neutral_not_perfect_balance_sheet():
+def test_positive_equity_alone_does_not_fabricate_a_core_metric():
     period=FinancialPeriod(period_end=NOW,equity=m(100))
     result=FundamentalEngine().evaluate(FundamentalSnapshot(symbol="AAA.IS",as_of=NOW,source="fixture",
         provider_status=FundamentalProviderStatus.PARTIAL,periods=[period]))
-    assert result.score_breakdown["balance_sheet_score"]==50
-    assert result.fundamental_score==50
+    assert result.fundamental_score is None and result.coverage==0
 
 
 def test_negative_baseline_growth_is_unavailable_and_margin_debt_trends_flagged():
@@ -418,7 +417,7 @@ def test_runtime_uses_documented_strategy_risk_reward_setting():
     assert "minimum_fundamental_score" not in type(settings.investment_policy).model_fields
 
 
-def test_runtime_fundamental_engine_consumes_documented_weights():
+def test_fundamental_engine_uses_fixed_documented_profile_weights():
     periods=[]
     for index in range(5):
         periods.append(FinancialPeriod(period_end=NOW-timedelta(days=90*index),revenue=m(200-index*20),
@@ -427,10 +426,62 @@ def test_runtime_fundamental_engine_consumes_documented_weights():
     snapshot=FundamentalSnapshot(symbol="AAA.IS",as_of=NOW,source="fixture",
         provider_status=FundamentalProviderStatus.AVAILABLE,periods=periods)
     settings=load_settings("config.yaml")
-    growth_weights={name:(1.0 if name=="growth_score" else 0.0) for name in settings.fundamental.weights}
-    balance_weights={name:(1.0 if name=="balance_sheet_score" else 0.0) for name in settings.fundamental.weights}
-    settings.fundamental.weights=growth_weights
-    growth_score=_build_fundamental_engine(settings).evaluate(snapshot).fundamental_score
-    settings.fundamental.weights=balance_weights
-    balance_score=_build_fundamental_engine(settings).evaluate(snapshot).fundamental_score
-    assert growth_score!=balance_score
+    result=_build_fundamental_engine(settings).evaluate(snapshot)
+    assert result.score_breakdown["profile"]=="GENERAL"
+    assert result.score_breakdown["renormalized_weights"]==pytest.approx({
+        "revenue_yoy":.20/.85,"net_margin":.15/.85,"roe":.15/.85,"ocf_net_income":.15/.85,
+        "equity_assets":.10/.85,"asset_yoy":.10/.85})
+    metric_values=result.score_breakdown["metric_values"]
+    assert set(metric_values)=={"revenue_yoy","gross_margin","net_margin","roe",
+        "ocf_net_income","equity_assets","asset_yoy"}
+    assert metric_values["gross_margin"] is None
+    assert metric_values["roe"]==result.derived_metrics["roe"].value
+    assert metric_values["ocf_net_income"]==result.derived_metrics["operating_cash_flow_vs_net_income"].value
+
+
+def test_bank_profile_renormalizes_only_available_bank_metrics():
+    periods=[FinancialPeriod(period_end=NOW-timedelta(days=90*index),net_income=m(20-index),
+        net_interest_income=m(50-index*2),loans=m(500-index*20),deposits=m(450-index*15),
+        equity=m(100),total_assets=m(1000)) for index in range(5)]
+    snapshot=FundamentalSnapshot(symbol="BANK.IS",as_of=NOW,source="fixture",
+        provider_status=FundamentalProviderStatus.PARTIAL,periods=periods,
+        audit_metadata={"company_type":"BANK"})
+    result=FundamentalEngine().evaluate(snapshot)
+    assert result.score_breakdown["profile"]=="BANK" and result.coverage==100
+    assert result.score_breakdown["renormalized_weights"]==pytest.approx({
+        "net_income_yoy":.20,"net_interest_income_yoy":.15,"loan_growth":.15,
+        "deposit_growth":.15,"roe":.15,"roa":.10,"equity_assets":.10})
+    assert set(result.score_breakdown["metric_values"])=={
+        "net_income_yoy","net_interest_income_yoy","loan_growth","deposit_growth","roe","roa","equity_assets"}
+    assert all(value is not None for value in result.score_breakdown["metric_values"].values())
+
+
+def test_general_profile_uses_cached_annual_flows_and_annual_balance_growth():
+    periods=[
+        FinancialPeriod(period_end=datetime(2026,6,30,tzinfo=timezone.utc),revenue=m(60),
+            gross_profit=m(24),net_income=m(8),operating_cash_flow=m(10),equity=m(120),total_assets=m(240)),
+        FinancialPeriod(period_end=datetime(2025,12,31,tzinfo=timezone.utc),
+            period_start=datetime(2025,1,1,tzinfo=timezone.utc),revenue=m(200),gross_profit=m(80),
+            net_income=m(20),operating_cash_flow=m(30),equity=m(100),total_assets=m(200)),
+        FinancialPeriod(period_end=datetime(2024,12,31,tzinfo=timezone.utc),
+            period_start=datetime(2024,1,1,tzinfo=timezone.utc),revenue=m(180),gross_profit=m(70),
+            net_income=m(18),operating_cash_flow=m(22),equity=m(90),total_assets=m(160))]
+    result=FundamentalEngine().evaluate(FundamentalSnapshot(symbol="AAA.IS",as_of=NOW,source="cache",
+        provider_status=FundamentalProviderStatus.PARTIAL,periods=periods))
+    assert result.derived_metrics["roe"].value==pytest.approx(20/95)
+    assert result.derived_metrics["roa"].value==pytest.approx(20/180)
+    assert result.derived_metrics["operating_cash_flow_vs_net_income"].value==pytest.approx(1.5)
+    assert result.derived_metrics["yoy_asset_growth"].value==pytest.approx(25)
+
+
+def test_ocf_net_income_stays_unknown_when_annual_periods_do_not_match():
+    periods=[
+        FinancialPeriod(period_end=datetime(2025,12,31,tzinfo=timezone.utc),
+            period_start=datetime(2025,1,1,tzinfo=timezone.utc),net_income=m(20),equity=m(100),total_assets=m(200)),
+        FinancialPeriod(period_end=datetime(2024,12,31,tzinfo=timezone.utc),
+            period_start=datetime(2024,1,1,tzinfo=timezone.utc),operating_cash_flow=m(30),equity=m(90),total_assets=m(180))]
+    result=FundamentalEngine().evaluate(FundamentalSnapshot(symbol="AAA.IS",as_of=NOW,source="cache",
+        provider_status=FundamentalProviderStatus.PARTIAL,periods=periods))
+    assert result.derived_metrics["roe"].available
+    assert not result.derived_metrics["operating_cash_flow_vs_net_income"].available
+    assert "ocf_net_income" in result.missing_metrics

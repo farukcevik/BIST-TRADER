@@ -48,6 +48,13 @@ PAPER_RESET_TABLES = (
     "macro_llm_cache",
 )
 
+# Legacy PAPER portfolio data may exist in databases created by older
+# migrations even though these tables are not part of the current schema.
+PAPER_OPTIONAL_RESET_TABLES = (
+    "imported_positions",
+    "portfolio_reviews",
+)
+
 # Only durable execution/accounting state can make an unmarked database unsafe
 # to adopt as PAPER. Analysis, signals, intelligence and risk audit records may
 # legitimately be written before the broker is constructed in a cycle.
@@ -109,6 +116,16 @@ def reset_paper_state(database: Database, *, mode: str, capital: object) -> Deci
             raise RuntimeError("invalid PAPER cash version in database")
         for table in PAPER_RESET_TABLES:
             connection.execute(f'DELETE FROM "{table}"')
+        existing_optional_tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?)",
+                PAPER_OPTIONAL_RESET_TABLES,
+            )
+        }
+        for table in PAPER_OPTIONAL_RESET_TABLES:
+            if table in existing_optional_tables:
+                connection.execute(f'DELETE FROM "{table}"')
         for key, value in (
             ("paper_cash", str(normalized_capital)),
             ("paper_initial_capital", str(normalized_capital)),

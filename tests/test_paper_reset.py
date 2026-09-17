@@ -9,7 +9,8 @@ from bistbot.broker.paper import PaperBroker
 from bistbot.portfolio.controls import PaperPortfolioControlService
 from bistbot.storage.database import Database
 from bistbot.storage.paper_reset import (CASH_VERSION_KEY, DATABASE_ENVIRONMENT_KEY,
-                                         PAPER_RESET_TABLES, reset_paper_state)
+                                         PAPER_OPTIONAL_RESET_TABLES, PAPER_RESET_TABLES,
+                                         reset_paper_state)
 
 
 def _seed_all_reset_tables(database: Database) -> None:
@@ -20,6 +21,7 @@ def _seed_all_reset_tables(database: Database) -> None:
         values=[]
         for column in columns:
             if column["name"]=="buy_tier": values.append("NORMAL")
+            elif column["name"]=="company_type": values.append("GENERAL")
             elif "INT" in column["type"].upper(): values.append(1)
             elif "REAL" in column["type"].upper(): values.append(1.0)
             else: values.append(f"seed-{column['name']}")
@@ -38,11 +40,21 @@ def test_full_paper_reset_is_atomic_and_preserves_schema_and_configuration(tmp_p
     database=Database(str(tmp_path/"paper.db"))
     try:
         _seed_all_reset_tables(database)
+        database.execute(
+            "CREATE TABLE imported_positions(symbol TEXT PRIMARY KEY, quantity INTEGER NOT NULL)"
+        )
+        database.execute(
+            "CREATE TABLE portfolio_reviews(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        database.execute("INSERT INTO imported_positions VALUES('THYAO.IS', 10)")
+        database.execute("INSERT INTO portfolio_reviews(payload) VALUES('{}')")
         capital=reset_paper_state(database,mode="PAPER",capital=200000)
 
         assert capital.as_tuple().exponent==-2
         assert all(database.query(f'SELECT COUNT(*) AS count FROM "{table}"')[0]["count"]==0
                    for table in PAPER_RESET_TABLES)
+        assert all(database.query(f'SELECT COUNT(*) AS count FROM "{table}"')[0]["count"]==0
+                   for table in PAPER_OPTIONAL_RESET_TABLES)
         metadata={row["key"]:row["value"] for row in database.query("SELECT key,value FROM metadata")}
         assert metadata["paper_cash"]=="200000.00"
         assert metadata["paper_initial_capital"]=="200000.00"
@@ -52,6 +64,8 @@ def test_full_paper_reset_is_atomic_and_preserves_schema_and_configuration(tmp_p
         assert database.query("SELECT symbol FROM symbols")[0]["symbol"]=="THYAO.IS"
         assert database.query("SELECT value FROM runtime_settings WHERE key='kept.setting'")[0]["value"]=="7"
         assert database.query("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_orders'")
+        assert all(database.query("SELECT name FROM sqlite_master WHERE type='table' AND name=?",(table,))
+                   for table in PAPER_OPTIONAL_RESET_TABLES)
     finally:
         database.close()
 
@@ -247,6 +261,24 @@ def test_reset_rolls_back_every_change_if_any_delete_fails(tmp_path):
             reset_paper_state(database,mode="PAPER",capital=200000)
         assert database.query("SELECT COUNT(*) AS count FROM market_snapshots")[0]["count"]==1
         assert database.query("SELECT COUNT(*) AS count FROM technical_signals")[0]["count"]==1
+    finally:
+        database.close()
+
+
+def test_reset_rolls_back_legacy_portfolio_deletes_with_every_other_change(tmp_path):
+    database=Database(str(tmp_path/"paper.db"))
+    try:
+        database.execute("CREATE TABLE imported_positions(symbol TEXT PRIMARY KEY)")
+        database.execute("CREATE TABLE portfolio_reviews(id INTEGER PRIMARY KEY)")
+        database.execute("INSERT INTO imported_positions VALUES('AAA')")
+        database.execute("INSERT INTO portfolio_reviews VALUES(1)")
+        database.execute("CREATE TRIGGER stop_legacy_reset BEFORE DELETE ON portfolio_reviews "
+                         "BEGIN SELECT RAISE(ABORT,'legacy reset failure'); END")
+        with pytest.raises(Exception,match="legacy reset failure"):
+            reset_paper_state(database,mode="PAPER",capital=200000)
+        assert database.query("SELECT symbol FROM imported_positions")[0]["symbol"]=="AAA"
+        assert database.query("SELECT id FROM portfolio_reviews")[0]["id"]==1
+        assert not database.query("SELECT value FROM metadata WHERE key='paper_cash'")
     finally:
         database.close()
 

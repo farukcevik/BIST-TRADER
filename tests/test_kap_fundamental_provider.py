@@ -3,18 +3,27 @@ import json
 from pathlib import Path
 from email.utils import format_datetime
 import urllib.error
+import threading
 import pytest
 
-from bistbot.fundamental import FundamentalEngine,FundamentalProviderStatus,KapFundamentalProvider
-from bistbot.fundamental.provider import _validated_shares
+from bistbot.fundamental import (FinancialPeriod,FundamentalEngine,FundamentalProviderStatus,
+    KapFundamentalProvider,Metric)
+from bistbot.fundamental.provider import _account_alias,_company_type,_validated_shares
 from bistbot.storage.database import Database
 
 NOW=datetime(2026,2,16,tzinfo=timezone.utc)
+def m(value):return Metric(value=value,available=True,source="fixture")
 
 def test_official_capital_conversion_requires_explicit_share_rule():
     assert _validated_shares({"paidCapital":1000,"nominalValuePerShare":1,"paidCapitalCurrency":"TRY",
         "nominalValueCurrency":"TRY","shareUnit":"ADET"})==1000
     assert _validated_shares({"paidCapital":1000,"nominalValuePerShare":1}) is None
+
+def test_kap_metadata_and_bank_labels_select_bank_profile_inputs():
+    assert _company_type({"sector":"Bankacılık","title":"Örnek Bankası"})=="BANK"
+    assert _company_type({"sector":"Perakende","title":"Örnek AŞ"})=="GENERAL"
+    assert [_account_alias(label) for label in ("Net Faiz Geliri","Krediler ve Alacaklar","Müşteri Mevduatları")]==[
+        "net_interest_income","loans","deposits"]
 
 class Response:
     status=200
@@ -169,6 +178,63 @@ def test_rate_limiter_is_shared_across_provider_instances(tmp_path):
     first._member_identity("AAA",NOW);second._member_identity("BBB",NOW)
     assert calls[1][1]-calls[0][1]>=.5 and sleeps==[.5]
 
+def test_default_kap_jitter_is_between_one_point_five_and_two_point_five_seconds(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close();calls=[];sleeps=[];ticks=[0.0]
+    def sleep(delay):sleeps.append(delay);ticks[0]+=delay
+    def opener(request,timeout):calls.append(ticks[0]);return Response([{"mkkMemberOid":"oid"}])
+    provider=KapFundamentalProvider(str(path),opener=opener,sleeper=sleep,
+        monotonic=lambda:ticks[0],jitter=lambda low,high:2.0)
+    provider._member_identity("AAA",NOW);provider._member_identity("BBB",NOW)
+    assert calls==[0.0,2.0] and sleeps==[2.0]
+
+def test_kap_requests_are_serialized_across_provider_instances(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close();entered=[];first_entered=threading.Event();release=threading.Event()
+    def opener(request,timeout):
+        entered.append(request.full_url)
+        if len(entered)==1:first_entered.set();release.wait(timeout=2)
+        return Response([{"mkkMemberOid":"oid"}])
+    first=KapFundamentalProvider(str(path),opener=opener,min_request_interval=0)
+    second=KapFundamentalProvider(str(path),opener=opener,min_request_interval=0)
+    threads=[threading.Thread(target=provider._member_identity,args=(ticker,NOW))
+        for provider,ticker in ((first,"AAA"),(second,"BBB"))]
+    for thread in threads:thread.start()
+    assert first_entered.wait(timeout=1) and len(entered)==1
+    release.set()
+    for thread in threads:thread.join(timeout=2)
+    assert len(entered)==2 and all(not thread.is_alive() for thread in threads)
+
+def test_concurrent_429_registers_retry_after_before_next_request(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close();calls=[];sleeps=[];ticks=[0.0]
+    first_entered=threading.Event();release=threading.Event();errors=[]
+    def sleep(delay):sleeps.append(delay);ticks[0]+=delay
+    def opener(request,timeout):
+        calls.append(ticks[0])
+        if len(calls)==1:
+            first_entered.set();release.wait(timeout=2);return Response({},status=429,headers={"Retry-After":"3"})
+        return Response([{"mkkMemberOid":"oid"}])
+    kwargs={"opener":opener,"sleeper":sleep,"monotonic":lambda:ticks[0],"min_request_interval":0,"max_attempts":1}
+    first=KapFundamentalProvider(str(path),**kwargs);second=KapFundamentalProvider(str(path),**kwargs)
+    def call(provider,ticker):
+        try:provider._member_identity(ticker,NOW)
+        except OSError as exc:errors.append(exc)
+    a=threading.Thread(target=call,args=(first,"AAA"));b=threading.Thread(target=call,args=(second,"BBB"))
+    a.start();assert first_entered.wait(timeout=1);b.start();release.set();a.join(timeout=2);b.join(timeout=2)
+    assert len(errors)==1 and calls==[0.0,3.0] and sleeps==[3.0]
+
+def test_legacy_member_without_company_type_is_refreshed_and_classified(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close();calls=[]
+    with Database(str(path)) as db:
+        db.execute("INSERT INTO kap_member_cache(symbol,mkk_member_oid,resolved_at,company_type) VALUES(?,?,?,NULL)",
+            ("BANK","legacy-oid",NOW.isoformat()))
+    def opener(request,timeout):
+        calls.append(request.full_url)
+        return Response([{"mkkMemberOid":"legacy-oid","sector":"Bankacılık","title":"Örnek Bankası"}])
+    provider=KapFundamentalProvider(str(path),opener=opener,sleeper=lambda _:None,min_request_interval=0)
+    assert provider._member_identity("BANK",NOW)=="legacy-oid"
+    assert provider._member_company_type("BANK")=="BANK"
+    provider._member_identity("BANK",NOW+timedelta(days=1))
+    assert len(calls)==1
+
 def test_refresh_backoff_uses_wall_clock_not_analysis_cutoff(tmp_path):
     path=tmp_path/"kap.sqlite";Database(str(path)).close();calls=[];wall=[NOW]
     def fail(request,timeout):calls.append(request.full_url);raise TimeoutError("offline")
@@ -256,6 +322,60 @@ def test_current_kap_bilingual_xbrl_rows_and_multi_column_labels_parse(tmp_path)
     periods=provider._parse_html(html)
     assert len(periods)==1 and periods[0].revenue.value==77_661_544
     assert periods[0].total_assets.value==250_000_000 and periods[0].net_income.value==8_000_000
+
+def test_specific_hierarchy_label_wins_and_cached_revisions_are_not_synthesized(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close();provider=KapFundamentalProvider(str(path))
+    html="""<div>Sunum Para Birimi: TL</div><table>
+      <tr><th>Parent</th><th>Leaf</th><th>31.12.2025</th></tr>
+      <tr><td>Toplam Varlıklar</td><td>Toplam Özkaynaklar</td><td>400</td></tr></table>"""
+    parsed=provider._parse_html(html,quarterize=False)
+    assert parsed[0].equity.value==400 and parsed[0].total_assets.value is None
+    annual=FinancialPeriod(period_end=datetime(2025,12,31,tzinfo=timezone.utc),
+        period_start=datetime(2025,1,1,tzinfo=timezone.utc),published_at=NOW-timedelta(days=30),
+        revenue=m(1000),net_income=m(100),operating_cash_flow=m(120),total_assets=m(800),
+        total_liabilities=m(300),equity=m(800))
+    comparative=FinancialPeriod(period_end=annual.period_end,published_at=NOW,
+        total_assets=m(900),total_liabilities=m(350),equity=m(900))
+    with Database(str(path)) as db:
+        for index,period in enumerate((annual,comparative)):
+            db.execute("INSERT INTO kap_raw_filing_periods VALUES(?,?,?,?,?,?)",
+                ("AAA",str(index),period.period_end.isoformat(),1,period.published_at.isoformat(),period.model_dump_json()))
+    loaded=provider._load("AAA")
+    assert loaded[0].revenue.value==1000 and loaded[0].operating_cash_flow.value==120
+    assert loaded[0].total_assets.value==800 and loaded[0].equity.value==500
+
+def test_cached_assets_misparsed_as_equity_stays_unknown_without_liabilities(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close();provider=KapFundamentalProvider(str(path))
+    period=FinancialPeriod(period_end=datetime(2025,12,31,tzinfo=timezone.utc),
+        period_start=datetime(2025,1,1,tzinfo=timezone.utc),published_at=NOW,
+        net_income=m(20),equity=m(900),total_assets=m(900))
+    with Database(str(path)) as db:
+        db.execute("INSERT INTO kap_raw_filing_periods VALUES(?,?,?,?,?,?)",
+            ("BANK","filing",period.period_end.isoformat(),0,NOW.isoformat(),period.model_dump_json()))
+    loaded=provider._load("BANK")
+    assert loaded[0].total_assets.value==900
+    assert loaded[0].equity.value is None
+
+def test_equity_equal_to_assets_is_valid_when_zero_liabilities_are_available(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close();provider=KapFundamentalProvider(str(path))
+    period=FinancialPeriod(period_end=datetime(2025,12,31,tzinfo=timezone.utc),
+        period_start=datetime(2025,1,1,tzinfo=timezone.utc),published_at=NOW,
+        equity=m(900),total_assets=m(900),total_liabilities=m(0))
+    with Database(str(path)) as db:
+        db.execute("INSERT INTO kap_raw_filing_periods VALUES(?,?,?,?,?,?)",
+            ("AAA","filing",period.period_end.isoformat(),1,NOW.isoformat(),period.model_dump_json()))
+    loaded=provider._load("AAA")
+    assert loaded[0].equity.value==900
+    assert loaded[0].equity.source=="derived:assets_minus_liabilities"
+
+def test_cached_permalink_classifies_bank_without_ticker_heuristic(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close()
+    with Database(str(path)) as db:
+        db.execute("INSERT INTO kap_member_cache(symbol,mkk_member_oid,permalink,resolved_at) VALUES(?,?,?,?)",
+            ("XYZ","oid","ornek-katilim-bankasi-a-s",NOW.isoformat()))
+    provider=KapFundamentalProvider(str(path))
+    assert provider._member_company_profile("XYZ")==("BANK","INFERRED","KAP_PERMALINK")
+    assert provider._member_company_profile("MISSING")==("GENERAL","PROVISIONAL","DEFAULT")
 
 def test_discovery_splits_at_result_limit_and_keeps_fr_filter_empty(tmp_path):
     path=tmp_path/"kap.sqlite";Database(str(path)).close();bodies=[]
@@ -390,11 +510,12 @@ def test_ytd_quarterization_consolidation_and_explicit_share_valuation(tmp_path)
     path=tmp_path/"kap.sqlite"; Database(str(path)).close()
     provider=KapFundamentalProvider(str(path),price_resolver=lambda _:(10,NOW))
     payload={"financials":[
-        {"periodEnd":"2025-06-30","periodStart":"2025-01-01","currency":"TRY","unit":1,"consolidated":True,"filingId":"new","facts":{"revenue":250,"net_income":50,"ebitda":80,"equity":500,"total_assets":900,"outstanding_shares":100}},
+        {"periodEnd":"2025-06-30","periodStart":"2025-01-01","currency":"TRY","unit":1,"consolidated":True,"filingId":"new","facts":{"revenue":250,"net_income":50,"net_interest_income":90,"ebitda":80,"equity":500,"total_assets":900,"outstanding_shares":100}},
         {"periodEnd":"2025-06-30","periodStart":"2025-01-01","currency":"TRY","unit":1,"consolidated":False,"filingId":"old","facts":{"revenue":1}},
-        {"periodEnd":"2025-03-31","periodStart":"2025-01-01","currency":"TRY","unit":1,"consolidated":True,"filingId":"q1","facts":{"revenue":100,"net_income":20,"ebitda":30,"equity":480,"total_assets":850}}]}
+        {"periodEnd":"2025-03-31","periodStart":"2025-01-01","currency":"TRY","unit":1,"consolidated":True,"filingId":"q1","facts":{"revenue":100,"net_income":20,"net_interest_income":35,"ebitda":30,"equity":480,"total_assets":850}}]}
     periods=provider._parse_periods(payload)
     assert len(periods)==2 and periods[0].consolidated and periods[0].revenue.value==150
+    assert periods[0].net_interest_income.value==55
     periods[0].net_debt.value=20;periods[0].net_debt.available=True
     provider._apply_valuation("AAA.IS",periods,NOW)
     assert periods[0].pb.value==2 and periods[0].ev_ebitda.value is None  # fewer than four quarters
@@ -402,3 +523,11 @@ def test_ytd_quarterization_consolidation_and_explicit_share_valuation(tmp_path)
                     periods[1].model_copy(update={"period_end":datetime(2024,9,30,tzinfo=timezone.utc)})])
     provider._apply_valuation("AAA.IS",periods,NOW)
     assert periods[0].ev_ebitda.available
+
+def test_valuation_stays_unknown_without_validated_outstanding_shares(tmp_path):
+    path=tmp_path/"kap.sqlite";Database(str(path)).close()
+    provider=KapFundamentalProvider(str(path),price_resolver=lambda _:(10,NOW))
+    periods=provider._parse_periods({"financials":[{"periodEnd":"2025-03-31","periodStart":"2025-01-01",
+        "currency":"TRY","unit":1,"consolidated":True,"facts":{"net_income":20,"equity":100}}]})
+    provider._apply_valuation("AAA.IS",periods,NOW)
+    assert not periods[0].market_cap.available and not periods[0].pe.available and not periods[0].pb.available
