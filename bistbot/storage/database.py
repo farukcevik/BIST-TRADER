@@ -28,6 +28,10 @@ class Database:
         for name,declaration in additions.items():
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE paper_positions ADD COLUMN {name} {declaration}")
+        for table in ("paper_orders","paper_fills"):
+            tier_columns={row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+            if "buy_tier" not in tier_columns:
+                self.connection.execute(f"ALTER TABLE {table} ADD COLUMN buy_tier TEXT")
         kap_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(kap_member_cache)")}
         if "outstanding_shares" not in kap_columns:
             self.connection.execute("ALTER TABLE kap_member_cache ADD COLUMN outstanding_shares REAL")
