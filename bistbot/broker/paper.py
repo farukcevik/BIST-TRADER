@@ -143,6 +143,7 @@ class PaperBroker:
         positions=self.get_positions(); old=positions.get(signal.symbol); cash=self.get_cash()
         high_rows=self.database.query("SELECT high_price FROM paper_positions WHERE symbol=?",(signal.symbol,))
         stored_high=Decimal(high_rows[0]["high_price"]) if high_rows else fill
+        buy_tier=signal.buy_tier or ("NORMAL" if signal.action is Action.BUY else None)
         if signal.action is Action.BUY:
             if old: raise ValueError("existing paper position; pyramiding disabled")
             exit_plan=self._exit_plan(risk_decision,requested)
@@ -163,15 +164,21 @@ class PaperBroker:
                     marker=connection.execute(f"SELECT {target_hit_column} FROM paper_positions WHERE symbol=?",
                         (signal.symbol,)).fetchone()
                     if marker is None or marker[target_hit_column]: raise _TargetAlreadyFilled(signal.symbol)
+            tier_row=self.database.connection.execute(
+                "SELECT buy_tier FROM paper_orders WHERE symbol=? AND side='BUY' AND status='FILLED' ORDER BY timestamp DESC,id DESC LIMIT 1",
+                (signal.symbol,)).fetchone()
+            buy_tier=tier_row["buy_tier"] if tier_row else None
             new_cash=money(cash+fill*quantity-commission); remaining=old.quantity-quantity
             realized=money((fill-old.average_price)*quantity-commission)
             position=None if remaining==0 else old.model_copy(update={"quantity":remaining,"last_price":fill,"updated_at":now})
         order=PaperOrder(signal_id=signal.id,symbol=signal.symbol,side=signal.action,quantity=quantity,
             requested_price=requested,fill_price=fill,timestamp=now,reason=signal.reason,final_score=signal.score,
-            risk_decision=risk_decision,strategy_version=signal.strategy_version,status=OrderStatus.FILLED)
+            risk_decision=risk_decision,strategy_version=signal.strategy_version,status=OrderStatus.FILLED,
+            buy_tier=buy_tier)
         realized=Decimal("0") if signal.action is Action.BUY else realized
         paper_fill=PaperFill(order_id=order.id,timestamp=now,symbol=signal.symbol,side=signal.action,
-                             quantity=quantity,fill_price=fill,commission=commission,realized_pnl=realized)
+                             quantity=quantity,fill_price=fill,commission=commission,realized_pnl=realized,
+                             buy_tier=buy_tier)
         with self.database.connection:
             connection=self.database.connection
             connection.execute("UPDATE metadata SET value=? WHERE key='paper_cash'",(str(new_cash),))
@@ -191,8 +198,8 @@ class PaperBroker:
                 (position.quantity,str(position.last_price),str(max(stored_high,fill)),position.updated_at.isoformat(),position.updated_at.isoformat(),position.symbol))
             if target_hit_column in {"target_1_hit","target_2_hit"} and position is not None:
                 connection.execute(f"UPDATE paper_positions SET {target_hit_column}=1 WHERE symbol=?",(signal.symbol,))
-            connection.execute("INSERT INTO paper_orders(id,signal_id,symbol,side,quantity,requested_price,fill_price,timestamp,reason,final_score,risk_decision,strategy_version,status,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(str(order.id),str(order.signal_id),order.symbol,order.side.value,order.quantity,str(order.requested_price),str(order.fill_price),order.timestamp.isoformat(),order.reason,order.final_score,order.risk_decision.model_dump_json(),order.strategy_version,order.status.value,order.model_dump_json()))
-            connection.execute("INSERT INTO paper_fills(id,order_id,timestamp,symbol,side,quantity,fill_price,commission,realized_pnl,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",(str(paper_fill.id),str(paper_fill.order_id),paper_fill.timestamp.isoformat(),paper_fill.symbol,paper_fill.side.value,paper_fill.quantity,str(paper_fill.fill_price),str(paper_fill.commission),str(paper_fill.realized_pnl),paper_fill.model_dump_json()))
+            connection.execute("INSERT INTO paper_orders(id,signal_id,symbol,side,quantity,requested_price,fill_price,timestamp,reason,final_score,risk_decision,strategy_version,status,payload,buy_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(str(order.id),str(order.signal_id),order.symbol,order.side.value,order.quantity,str(order.requested_price),str(order.fill_price),order.timestamp.isoformat(),order.reason,order.final_score,order.risk_decision.model_dump_json(),order.strategy_version,order.status.value,order.model_dump_json(),buy_tier))
+            connection.execute("INSERT INTO paper_fills(id,order_id,timestamp,symbol,side,quantity,fill_price,commission,realized_pnl,payload,buy_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(str(paper_fill.id),str(paper_fill.order_id),paper_fill.timestamp.isoformat(),paper_fill.symbol,paper_fill.side.value,paper_fill.quantity,str(paper_fill.fill_price),str(paper_fill.commission),str(paper_fill.realized_pnl),paper_fill.model_dump_json(),buy_tier))
         self.notifier.send("BUY" if signal.action is Action.BUY else "SELL",f"{signal.symbol} x{quantity} @ {fill}")
         if signal.action is Action.SELL and signal.reason in {reason.value for reason in ExitReason}:
             self.notifier.send(signal.reason,f"{signal.symbol} x{quantity} @ {fill}")
