@@ -94,6 +94,24 @@ def test_stale_position_is_flagged_and_old_price_not_used_for_exit(tmp_path):
     assert app.last_diagnostics["positions"][0]["action"]=="STALE_MARKET_DATA — NO ASSUMPTION"
 
 
+def test_runtime_diagnostics_use_persisted_position_stop(tmp_path):
+    app,_,database,_=application(tmp_path,result("AAA.IS",105))
+    database.execute("UPDATE paper_positions SET stop_price=? WHERE symbol=?",("96.25","AAA.IS"))
+
+    app.run_cycle(now=NOW)
+
+    assert app.last_diagnostics["positions"][0]["stop"]=="96.25"
+
+
+def test_runtime_diagnostics_fall_back_to_default_stop_for_legacy_position(tmp_path):
+    app,_,_,_=application(tmp_path,result("AAA.IS",105))
+
+    app.run_cycle(now=NOW)
+
+    expected=Decimal("100")*(Decimal("1")-Decimal(str(app.settings.risk.default_stop_loss_pct)))
+    assert Decimal(app.last_diagnostics["positions"][0]["stop"])==expected
+
+
 def test_high_water_and_trailing_stop_never_move_down(tmp_path):
     settings=load_settings("config.v1.yaml"); database=Database(str(tmp_path/"high.db"))
     broker=PaperBroker(10_000,database=database,risk_settings=settings.risk); open_position(broker)
@@ -112,3 +130,9 @@ def test_status_exposes_stale_data_and_percentage_points(tmp_path):
     status=paper_status(database,settings); item=status["positions"]["AAA.IS"]
     assert item["market_data_status"]=="STALE_MARKET_DATA" and status["warnings"]
     assert item["unrealized_pnl_pct"].endswith("%")
+
+def test_runtime_applies_effective_max_open_positions_each_cycle(tmp_path):
+    app,_,_,_=application(tmp_path,result("AAA.IS",105))
+    app.portfolio_controls.set_max_open_positions(2,expected_version=0,idempotency_token="runtime-max")
+    app.run_cycle(now=NOW)
+    assert app.risk.settings.max_open_positions==2
