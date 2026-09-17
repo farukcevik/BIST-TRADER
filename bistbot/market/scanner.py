@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from bistbot.app.config import ScannerSettings
 from bistbot.app.models import MarketBar, TechnicalSignal
 from bistbot.storage.repositories import TechnicalSignalRepository
-from .indicators import atr, ema, return_pct, rsi, volatility_pct
+from .indicators import atr, ema, macd, return_pct, rsi, simple_moving_average, volatility_pct
 
 
 def _clamp(value: float) -> float:
@@ -51,6 +51,11 @@ class DeterministicMarketScanner:
         momentum_3 = return_pct(close, closes[-4])
         momentum_12 = return_pct(close, closes[-13])
         ema_9, ema_21 = ema(closes, 9), ema(closes, 21)
+        averages={}
+        for period in (20,50,200):
+            averages[f"sma_{period}"]=simple_moving_average(closes,period)
+            averages[f"ema_{period}"]=ema(closes,period) if len(closes)>=period else None
+        macd_values=macd(closes) if len(closes)>=34 else (None,None,None)
         rsi_14 = rsi(closes, 14); atr_14 = atr(highs, lows, closes, 14)
         lookback = self.settings.recent_high_lookback
         prior_high = max(highs[-lookback-1:-1]) if len(highs) > lookback else max(highs[:-1])
@@ -113,6 +118,15 @@ class DeterministicMarketScanner:
             "latest_price":close,"latest_volume":latest_volume,"trading_continuity":continuity,
             "volume_method":volume_method,"current_interval_volume":latest_volume,
             "historical_comparable_volume":average_volume,
+            **{key:(value if value is not None else "UNAVAILABLE") for key,value in averages.items()},
+            "macd":macd_values[0] if macd_values[0] is not None else "UNAVAILABLE",
+            "macd_signal":macd_values[1] if macd_values[1] is not None else "UNAVAILABLE",
+            "macd_histogram":macd_values[2] if macd_values[2] is not None else "UNAVAILABLE",
+            "above_sma_20":close>averages["sma_20"] if averages["sma_20"] else False,
+            "above_sma_50":close>averages["sma_50"] if averages["sma_50"] else False,
+            "above_sma_200":close>averages["sma_200"] if averages["sma_200"] else False,
+            "moving_average_alignment":("BULLISH" if all(averages[key] is not None for key in ("ema_20","ema_50","ema_200")) and averages["ema_20"]>averages["ema_50"]>averages["ema_200"] else
+                "BEARISH" if all(averages[key] is not None for key in ("ema_20","ema_50","ema_200")) and averages["ema_20"]<averages["ema_50"]<averages["ema_200"] else "MIXED"),
             "volatility_pct":volatility}, reasons=reasons)
 
     def _validate(self, symbol: str, bars: Sequence[MarketBar], now: datetime) -> None:

@@ -18,6 +18,15 @@ def ema(values: Sequence[float], period: int) -> float:
     return value
 
 
+def macd(values: Sequence[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float, float, float]:
+    if len(values) < slow + signal - 1: raise ValueError("insufficient values for MACD")
+    line_series=[]
+    for end in range(slow,len(values)+1):
+        subset=values[:end]; line_series.append(ema(subset,fast)-ema(subset,slow))
+    signal_value=ema(line_series,signal)
+    return line_series[-1],signal_value,line_series[-1]-signal_value
+
+
 def rsi(values: Sequence[float], period: int = 14) -> float:
     if len(values) < period + 1: raise ValueError("insufficient values for RSI")
     changes = [values[i] - values[i-1] for i in range(1, len(values))]
@@ -47,4 +56,3 @@ def volatility_pct(values: Sequence[float], period: int = 14) -> float:
     mean = sum(returns) / len(returns)
     variance = sum((item-mean)**2 for item in returns) / len(returns)
     return math.sqrt(variance) * 100
-
