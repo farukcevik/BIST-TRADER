@@ -27,6 +27,9 @@ class DeterministicRiskEngine:
         self.settings,self.repository,self.kill_switch=settings,repository,kill_switch
         self.sizer=DeterministicPositionSizer(settings)
 
+    def update_settings(self,settings:RiskSettings)->None:
+        self.settings=settings; self.sizer=DeterministicPositionSizer(settings)
+
     def evaluate(self,request: RiskOrderRequest,portfolio: PortfolioState,now: datetime | None=None) -> RiskDecision:
         now=now or datetime.now(timezone.utc)
         if request.action not in {Action.BUY,Action.SELL}:
@@ -60,7 +63,7 @@ class DeterministicRiskEngine:
         if portfolio.drawdown_pct >= Decimal(str(self.settings.max_total_drawdown_pct)):
             return self._save(request,RiskOutcome.HALT_TRADING,RiskReasonCode.MAX_DRAWDOWN,"Maximum drawdown reached")
         if request.symbol not in portfolio.positions and len(portfolio.positions)>=self.settings.max_open_positions:
-            return self._save(request,RiskOutcome.REJECT,RiskReasonCode.MAX_POSITIONS,"Maximum open positions reached")
+            return self._save(request,RiskOutcome.REJECT,RiskReasonCode.MAX_OPEN_POSITIONS,"Maximum open positions reached")
         sizing=self.sizer.size(request,portfolio); metadata={"maximum_by_position":sizing.maximum_by_position,
             "maximum_by_risk":sizing.maximum_by_risk,"maximum_by_cash":sizing.maximum_by_cash}
         if sizing.quantity<=0:
