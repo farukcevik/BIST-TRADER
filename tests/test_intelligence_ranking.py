@@ -65,6 +65,7 @@ def test_one_provider_can_fail_while_other_enriches():
     disclosure = event("AAA",EventSourceType.KAP,"Regulatory approval")
     result = ranker(kap=[disclosure],news_error=TimeoutError("down")).rank([candidate("AAA",50)],now=NOW)[0]
     assert result.event_score > 0 and result.event_ids == [disclosure.id]
+    assert result.reasons[0] == "partial intelligence: NEWS provider failures"
 
 
 def test_returns_top_ten_with_deterministic_ranking():
@@ -83,4 +84,3 @@ def test_persists_deduplicated_events_rankings_and_errors(tmp_path):
     assert database.query("SELECT COUNT(*) n FROM intelligence_rankings")[0]["n"] == 1
     assert database.query("SELECT COUNT(*) n FROM system_events WHERE event_type='INTELLIGENCE_PROVIDER_ERROR'")[0]["n"] >= 1
     database.close()
-

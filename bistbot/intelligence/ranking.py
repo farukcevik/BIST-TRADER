@@ -68,7 +68,13 @@ class EventRanker:
             if len(scores) > 1: event_score = min(100.0, event_score*.8 + sum(scores)/len(scores)*.2)
             combined = (candidate.overall_scanner_score if not any_events else
                         candidate.overall_scanner_score*self.settings.scanner_weight + event_score*self.settings.event_weight)
-            reasons = ["external providers unavailable; scanner rank preserved"] if not any_events and errors else []
+            reasons = []
+            if errors:
+                failed_sources = ", ".join(sorted({source for source, _ in errors}))
+                if not any_events:
+                    reasons.append(f"{failed_sources} providers unavailable; scanner rank preserved")
+                else:
+                    reasons.append(f"partial intelligence: {failed_sources} provider failures")
             material_events=[event for event in symbol_events if event.materiality_score>=self.settings.llm_materiality_threshold]
             if symbol_events: reasons.append(f"{len(symbol_events)} unique event(s), {len(material_events)} material")
             ranked.append(RankedEventCandidate(symbol=candidate.symbol, scanner_score=candidate.overall_scanner_score,
