@@ -96,13 +96,22 @@ class DeterministicStrategyEngine:
         if minimum_risk_reward_ratio<=0: raise ValueError("minimum risk/reward must be positive")
         technical_min=self.settings.buy_threshold if minimum_technical_score is None else minimum_technical_score
         labels=[]; reason_code="BUY_CANDIDATE"; action=Action.BUY
+        has_fundamental_data=(fundamental.coverage>0 or bool(fundamental.available_metrics) or
+            fundamental.fundamental_score is not None or fundamental.effective_score is not None)
         fallback=(fundamental.provider_status.value=="UNAVAILABLE" or
             fundamental.fundamental_score is None or fundamental.effective_score is None)
         if fundamental.blocks_entry:
             action,reason_code=Action.HOLD,"FUNDAMENTAL_BLOCKING_RED_FLAG"
         elif fallback:
             if unavailable_policy is FundamentalUnavailablePolicy.BLOCK:
-                action,reason_code=Action.HOLD,"FUNDAMENTAL_DATA_UNAVAILABLE"
+                if not has_fundamental_data:
+                    reason_code="FUNDAMENTAL_DATA_UNAVAILABLE"
+                elif (fundamental.fundamental_score is not None and fundamental.effective_score is not None
+                        and fundamental.confidence<minimum_fundamental_confidence):
+                    reason_code="FUNDAMENTAL_CONFIDENCE_LOW"
+                else:
+                    reason_code="FUNDAMENTAL_COVERAGE_LOW"
+                action=Action.HOLD
             else:
                 labels.append("FUNDAMENTAL_DATA_UNAVAILABLE_FALLBACK")
                 if technical.technical_score<fallback_minimum_technical_score:

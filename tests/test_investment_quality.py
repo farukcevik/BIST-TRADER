@@ -280,7 +280,7 @@ def test_effective_fundamental_score_calibrates_buy_gate_without_changing_raw_sc
     assert "effective_fundamental=45" in decision.reason
 
 
-def test_missing_effective_score_uses_unavailable_policy_without_fabricating_zero():
+def test_missing_effective_score_uses_low_coverage_reason_without_changing_fallback_policy():
     technical,fundamental,catalyst,potential=_fallback_inputs()
     fundamental=fundamental.model_copy(update={"provider_status":FundamentalProviderStatus.PARTIAL,
         "fundamental_score":100,"effective_score":None,"coverage":40,"confidence":80})
@@ -288,9 +288,20 @@ def test_missing_effective_score_uses_unavailable_policy_without_fabricating_zer
         unavailable_policy=FundamentalUnavailablePolicy.BLOCK)
     fallback=_engine().evaluate_investment(technical,fundamental,catalyst,potential,
         unavailable_policy=FundamentalUnavailablePolicy.TECHNICAL_ONLY_FALLBACK)
-    assert blocked.action is Action.HOLD and blocked.reason_code=="FUNDAMENTAL_DATA_UNAVAILABLE"
+    assert blocked.action is Action.HOLD and blocked.reason_code=="FUNDAMENTAL_COVERAGE_LOW"
     assert fallback.action is Action.BUY
     assert blocked.fundamental_score==100 and "effective_fundamental=None" in blocked.reason
+
+
+def test_vakbn_like_nonzero_coverage_uses_low_confidence_even_if_provider_is_unavailable():
+    technical,fundamental,catalyst,potential=_fallback_inputs()
+    fundamental=fundamental.model_copy(update={"provider_status":FundamentalProviderStatus.UNAVAILABLE,
+        "fundamental_score":75,"effective_score":20,"coverage":14.2857,"confidence":13.75,
+        "available_metrics":["roe"],"missing_metrics":["net_income_yoy"]})
+    decision=_engine().evaluate_investment(technical,fundamental,catalyst,potential,
+        unavailable_policy=FundamentalUnavailablePolicy.BLOCK)
+    assert decision.action is Action.HOLD and decision.reason_code=="FUNDAMENTAL_CONFIDENCE_LOW"
+    assert "FUNDAMENTAL_DATA_UNAVAILABLE_FALLBACK" not in decision.labels
 
 
 @pytest.mark.parametrize(("overrides","reason"),[
