@@ -341,6 +341,7 @@ class TradeSignal(BaseModel):
     reason: str
     strategy_version: str
     requested_price: float = Field(gt=0)
+    buy_tier: Literal["NORMAL","FLEX"] | None = None
 
 
 class RiskOutcome(StrEnum):
@@ -353,7 +354,8 @@ class RiskOutcome(StrEnum):
 class RiskReasonCode(StrEnum):
     APPROVED = "APPROVED"
     KILL_SWITCH = "KILL_SWITCH"
-    MAX_POSITIONS = "MAX_POSITIONS"
+    MAX_OPEN_POSITIONS = "MAX_OPEN_POSITIONS"
+    MAX_POSITIONS = "MAX_OPEN_POSITIONS"
     MAX_POSITION_SIZE = "MAX_POSITION_SIZE"
     MAX_TRADE_RISK = "MAX_TRADE_RISK"
     MIN_CASH_RESERVE = "MIN_CASH_RESERVE"
@@ -433,6 +435,7 @@ class PaperOrder(BaseModel):
     risk_decision: RiskDecision
     strategy_version: str
     status: OrderStatus
+    buy_tier: Literal["NORMAL","FLEX"] | None = None
 
 
 class PaperFill(BaseModel):
@@ -445,6 +448,7 @@ class PaperFill(BaseModel):
     fill_price: Decimal = Field(gt=0)
     commission: Decimal = Field(ge=0)
     realized_pnl: Decimal = Decimal("0")
+    buy_tier: Literal["NORMAL","FLEX"] | None = None
 
 
 class Position(BaseModel):

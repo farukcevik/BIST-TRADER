@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -46,6 +48,45 @@ class MarketDataSettings(BaseModel):
     yahoo_execution_freshness_seconds: int = Field(default=1200,gt=0)
 
 
+class FundamentalUnavailablePolicy(StrEnum):
+    BLOCK = "BLOCK"
+    TECHNICAL_ONLY_FALLBACK = "TECHNICAL_ONLY_FALLBACK"
+
+
+class FundamentalSettings(BaseModel):
+    enabled: bool = True
+    minimum_confidence: float = Field(default=40,ge=0,le=100)
+    unavailable_policy: FundamentalUnavailablePolicy = FundamentalUnavailablePolicy.TECHNICAL_ONLY_FALLBACK
+    fallback_minimum_risk_reward_ratio: float = Field(default=2.0,gt=0)
+    fallback_minimum_technical_score: float = Field(default=75,ge=0,le=100)
+    fallback_minimum_potential_confidence: float = Field(default=65,ge=0,le=100)
+    minimum_score: float = Field(default=50,ge=0,le=100)
+    weights: dict[str,float] = Field(default_factory=lambda:{"growth_score":.20,"profitability_score":.18,
+        "cash_flow_quality_score":.20,"balance_sheet_score":.20,"valuation_score":.12,"consistency_score":.10})
+
+
+class ValuationSettings(BaseModel):
+    enabled: bool = True
+
+
+class TechnicalLevelsSettings(BaseModel):
+    enabled: bool = True
+    swing_window: int = Field(default=3,ge=2)
+    zone_atr_fraction: float = Field(default=.35,gt=0)
+    dedup_atr_fraction: float = Field(default=.05,gt=0)
+    tick_size: float = Field(default=.01,gt=0)
+
+
+class PotentialSettings(BaseModel):
+    enabled: bool = True
+
+
+class StrategyPolicySettings(BaseModel):
+    minimum_risk_reward_ratio: float = Field(default=1.5,gt=0)
+    minimum_catalyst_score: float = Field(default=50,ge=0,le=100)
+    require_catalyst_confirmation: bool = True
+
+
 class RegimeBehavior(BaseModel):
     score_adjustment: float = 0
     buy_threshold_adjustment: float = 0
@@ -83,6 +124,12 @@ class ScoringSettings(BaseModel):
         if abs(total - 1.0) > 1e-9:
             raise ValueError("scoring weights must sum to 1.0")
         return self
+
+
+class InvestmentPolicySettings(BaseModel):
+    minimum_technical_score: float | None = Field(default=None, ge=0, le=100)
+    speculative_technical_score: float = Field(default=80, ge=0, le=100)
+    speculative_catalyst_score: float = Field(default=65, ge=0, le=100)
 
 
 class ScannerWeights(BaseModel):
@@ -144,6 +191,7 @@ class IntelligenceSettings(BaseModel):
 
 
 class Settings(BaseModel):
+    trading_mode: Literal["PAPER"] = "PAPER"
     capital: float = Field(gt=0)
     database: str
     strategy_version: str
@@ -153,12 +201,18 @@ class Settings(BaseModel):
     risk: RiskSettings
     execution: ExecutionSettings
     scoring: ScoringSettings
+    investment_policy: InvestmentPolicySettings = Field(default_factory=InvestmentPolicySettings)
     scanner: ScannerSettings
     intelligence: IntelligenceSettings
     llm: LLMSettings = Field(default_factory=LLMSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     market_regime: MarketRegimeSettings = Field(default_factory=MarketRegimeSettings)
+    fundamental: FundamentalSettings = Field(default_factory=FundamentalSettings)
+    valuation: ValuationSettings = Field(default_factory=ValuationSettings)
+    technical_levels: TechnicalLevelsSettings = Field(default_factory=TechnicalLevelsSettings)
+    potential: PotentialSettings = Field(default_factory=PotentialSettings)
+    strategy: StrategyPolicySettings = Field(default_factory=StrategyPolicySettings)
 
 
 def load_settings(path: str | Path = "config.yaml", capital: float | None = None) -> Settings:
@@ -177,7 +231,8 @@ def _normalize_alternate_config(source: dict) -> dict:
     scanner_weights["volatility"]=scanner_weights.pop("trend",scanner_weights.get("volatility",.10))
     intelligence=source.get("intelligence",{}); final_score=source.get("final_score",{})
     strategy=source.get("strategy",{}); paper=source.get("paper",{}); scheduler=source.get("scheduler",{})
-    return {"capital":portfolio.get("initial_capital",200000),"database":source.get("database","bistbot.db"),
+    return {"trading_mode":str(source.get("system",{}).get("mode","PAPER")).upper(),
+        "capital":portfolio.get("initial_capital",200000),"database":source.get("database","bistbot.db"),
         "strategy_version":source.get("system",{}).get("strategy_version","v1.0.0"),
         "schedule_seconds":scheduler.get("market_scan_seconds",300),
         "scanner_top_n":min(40,scanner.get("candidate_limit",40)),
@@ -210,6 +265,11 @@ def _normalize_alternate_config(source: dict) -> dict:
         "dashboard":source.get("dashboard",{}),
         "market_data":source.get("market_data",{}),
         "market_regime":source.get("market_regime",{}),
+        "fundamental":source.get("fundamental",{}),"valuation":source.get("valuation",{}),
+        "technical_levels":source.get("technical_levels",{}),"potential":source.get("potential",{}),
+        "strategy":{"minimum_risk_reward_ratio":strategy.get("minimum_risk_reward_ratio",1.5),
+            "minimum_catalyst_score":strategy.get("minimum_catalyst_score",50),
+            "require_catalyst_confirmation":strategy.get("require_catalyst_confirmation",True)},
         "scoring":{**{key:final_score.get(key,value) for key,value in {"technical":.3,"momentum":.2,"volume":.15,
             "news_kap":.2,"llm":.15}.items()},"buy_threshold":strategy.get("buy_threshold",65),
             "sell_threshold":strategy.get("sell_threshold",35)}}

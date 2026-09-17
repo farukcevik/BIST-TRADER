@@ -47,6 +47,22 @@ strategy:
   buy_threshold: 72
   strong_buy_threshold: 82
   sell_threshold: 38
+  minimum_risk_reward_ratio: 1.5
+  minimum_catalyst_score: 50
+  require_catalyst_confirmation: true
+
+fundamental:
+  enabled: true
+  minimum_confidence: 40
+  unavailable_policy: TECHNICAL_ONLY_FALLBACK
+  fallback_minimum_risk_reward_ratio: 2.0
+  fallback_minimum_technical_score: 75
+  fallback_minimum_potential_confidence: 65
+  minimum_score: 50
+  weights: {growth_score: 0.20, profitability_score: 0.18, cash_flow_quality_score: 0.20, balance_sheet_score: 0.20, valuation_score: 0.12, consistency_score: 0.10}
+valuation: {enabled: true}
+technical_levels: {enabled: true, swing_window: 3, zone_atr_fraction: 0.35, dedup_atr_fraction: 0.05, tick_size: 0.01}
+potential: {enabled: true}
 
 paper:
   commission_pct: 0.001
