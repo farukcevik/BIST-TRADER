@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 from bistbot.app.models import (EventItem, LLMAnalysis, MacroEvent, MacroLLMAnalysis, MarketRegimeState, NewsItem,
     RankedEventCandidate, RiskDecision, TechnicalSignal, TradeSignal)
 from .database import Database
@@ -38,6 +39,58 @@ class TechnicalSignalRepository:
         payload["rank"] = rank
         self.database.execute("INSERT INTO technical_signals(timestamp,symbol,score,payload) VALUES(?,?,?,?)",
             (signal.timestamp.isoformat(), signal.symbol, signal.overall_scanner_score, json.dumps(payload)))
+
+
+class InvestmentAnalysisRepository:
+    """Append-only persistence for explainable investment-analysis artifacts."""
+    def __init__(self, database: Database): self.database = database
+
+    def add_fundamental_snapshot(self, snapshot: Any) -> None:
+        self.database.execute(
+            "INSERT INTO fundamental_snapshots(timestamp,symbol,provider_status,payload) VALUES(?,?,?,?)",
+            (snapshot.as_of.isoformat(), snapshot.symbol, _enum_value(snapshot.provider_status),
+             snapshot.model_dump_json()))
+
+    def add_fundamental_score(self, assessment: Any) -> None:
+        self.database.execute(
+            "INSERT INTO fundamental_scores(timestamp,symbol,score,confidence,provider_status,payload) VALUES(?,?,?,?,?,?)",
+            (assessment.as_of.isoformat(), assessment.symbol, assessment.fundamental_score,
+             assessment.confidence, _enum_value(assessment.provider_status), assessment.model_dump_json()))
+
+    def add_technical_levels(self, assessment: Any, *, provenance: dict | None = None) -> None:
+        payload=assessment.model_dump(mode="json"); payload["provenance"]=provenance or {}
+        self.database.execute(
+            "INSERT INTO technical_levels(timestamp,symbol,confidence,payload) VALUES(?,?,?,?)",
+            (_artifact_timestamp(assessment), assessment.symbol, assessment.confidence,
+             json.dumps(payload)))
+
+    def add_potential_assessment(self, assessment: Any, *, symbol: str | None = None,
+                                 timestamp: Any | None = None, provenance: dict | None = None) -> None:
+        payload=assessment.model_dump(mode="json"); payload["provenance"]=provenance or {}
+        confidence=getattr(assessment,"target_confidence",None)
+        if confidence is None: confidence=getattr(assessment,"confidence",None)
+        if confidence is None:
+            raise ValueError("potential assessment must expose non-null confidence")
+        self.database.execute(
+            "INSERT INTO potential_assessments(timestamp,symbol,score,confidence,payload) VALUES(?,?,?,?,?)",
+            ((timestamp.isoformat() if timestamp is not None else _artifact_timestamp(assessment)),
+             symbol or getattr(assessment, "symbol", None) or _missing_symbol(), assessment.potential_score,
+             confidence,json.dumps(payload)))
+
+
+def _artifact_timestamp(artifact: Any) -> str:
+    for name in ("timestamp", "as_of", "decision_timestamp"):
+        value = getattr(artifact, name, None)
+        if value is not None: return value.isoformat()
+    raise ValueError("analysis artifact must expose timestamp, as_of, or decision_timestamp")
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value))
+
+
+def _missing_symbol():
+    raise ValueError("analysis artifact must expose symbol or receive symbol explicitly")
 
 
 class EventRepository:
