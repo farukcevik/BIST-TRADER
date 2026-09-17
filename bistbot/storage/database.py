@@ -9,6 +9,7 @@ from .schema import SCHEMA
 
 class Database:
     def __init__(self, path: str, *, read_only: bool=False):
+        self.path = str(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro",uri=True) if read_only else sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
