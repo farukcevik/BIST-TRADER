@@ -16,6 +16,7 @@ from bistbot.market.execution_policy import DEFAULT_EXECUTION_FRESHNESS_SECONDS,
 from bistbot.portfolio.service import PortfolioPosition,money
 from bistbot.portfolio.service import PortfolioState
 from bistbot.storage.database import Database
+from bistbot.storage.paper_reset import DATABASE_ENVIRONMENT_KEY,assert_paper_database_adoptable
 from bistbot.storage.repositories import RiskDecisionRepository,SystemStateRepository
 
 PRICE_STEP=Decimal("0.0001")
@@ -38,12 +39,29 @@ class PaperBroker:
         self.clock=clock or (lambda:datetime.now(timezone.utc))
         capital=money(starting_cash)
         if capital<=0 or self.commission_pct<0 or self.slippage_pct<0: raise ValueError("invalid paper broker configuration")
-        self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_cash',?)",(str(capital),))
-        self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_initial_capital',?)",(str(capital),))
-        self.database.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_realized_pnl','0.00')")
+        connection=self.database.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            assert_paper_database_adoptable(connection)
+            connection.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES(?, 'PAPER')",
+                               (DATABASE_ENVIRONMENT_KEY,))
+            connection.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_cash',?)",(str(capital),))
+            connection.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_initial_capital',?)",(str(capital),))
+            connection.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('paper_realized_pnl','0.00')")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     def get_cash(self) -> Decimal:
         return money(self.database.query("SELECT value FROM metadata WHERE key='paper_cash'")[0]["value"])
+
+    def set_cash(self,amount,*,expected_version:int,idempotency_token:str,actor:str="api"):
+        from bistbot.portfolio.controls import PaperPortfolioControlService
+        configured=self.risk_settings.max_open_positions if self.risk_settings else 1
+        return PaperPortfolioControlService(self.database,mode="PAPER",
+            configured_max_open_positions=configured).set_cash(amount,expected_version=expected_version,
+                idempotency_token=idempotency_token,actor=actor)
 
     def get_positions(self) -> dict[str,PortfolioPosition]:
         positions={}
@@ -90,7 +108,6 @@ class PaperBroker:
     def buy(self,signal: TradeSignal,risk_decision: RiskDecision,*,execution_time: datetime|None=None,
             execution_provider:str|None=None) -> PaperOrder:
         if signal.action is not Action.BUY: raise ValueError("buy requires BUY signal")
-        if signal.symbol in self.get_positions(): raise ValueError("existing paper position; pyramiding disabled")
         if risk_decision.signal_id!=signal.id or not risk_decision.approved:
             self.notify_risk_rejection(signal.symbol,risk_decision); raise PermissionError("risk decision does not approve this signal")
         self._guard_execution(signal.timestamp,signal.requested_price,execution_time or signal.timestamp,execution_provider)
@@ -102,9 +119,18 @@ class PaperBroker:
         if (risk_decision.signal_id!=signal.id or not risk_decision.approved or
                 quantity>risk_decision.approved_quantity): raise PermissionError("sell is not approved")
         self._guard_execution(signal.timestamp,signal.requested_price,execution_time or signal.timestamp,execution_provider)
-        return self._fill(signal,quantity,risk_decision)
+        return self._fill(signal,quantity,risk_decision,target_hit_column=_target_hit_column)
 
-    def _fill(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision) -> PaperOrder:
+    def _fill(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision,*,target_hit_column:str|None=None) -> PaperOrder:
+        connection=self.database.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._fill_locked(signal,quantity,risk_decision,target_hit_column=target_hit_column)
+        except Exception:
+            connection.rollback(); raise
+
+    def _fill_locked(self,signal: TradeSignal,quantity: int,risk_decision: RiskDecision,*,target_hit_column:str|None=None) -> PaperOrder:
+        connection=self.database.connection
         if quantity<=0: raise ValueError("quantity must be positive")
         requested=Decimal(str(signal.requested_price)); side_multiplier=(Decimal("1")+self.slippage_pct
             if signal.action is Action.BUY else Decimal("1")-self.slippage_pct)
