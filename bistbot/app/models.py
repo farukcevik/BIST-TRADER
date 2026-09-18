@@ -209,6 +209,7 @@ class MarketOverlay(BaseModel):
 class IntelligenceStatus(StrEnum):
     NO_NEWS = "NO_NEWS"
     EVENTS_AVAILABLE = "EVENTS_AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
 
 
 class ProviderState(StrEnum):
@@ -235,6 +236,11 @@ class IntelligenceProviderDiagnostics(BaseModel):
     latest_event: datetime | None = None
     error_type: str | None = None
     error_message: str | None = None
+    cooldown_until: datetime | None = None
+    cursor_published_at: datetime | None = None
+    backfill_from: datetime | None = None
+    cached_events: int = Field(default=0, ge=0)
+    cleanup_deleted: int = Field(default=0, ge=0)
 
 
 class LLMStatus(StrEnum):

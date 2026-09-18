@@ -72,7 +72,11 @@ class BistBotApplication:
         self.settings,self.database,self.broker,self.notifier=settings,database,broker,notifier
         self.market=market or YahooBistProvider(yahoo_execution_freshness_seconds=
             settings.market_data.yahoo_execution_freshness_seconds)
-        self.news=news or YahooFinanceNewsProvider(); self.kap=kap or RealKapProvider()
+        self.news=news or YahooFinanceNewsProvider()
+        self.kap=kap or RealKapProvider(database=database,
+            retention_days=settings.intelligence.kap_retention_days,
+            base_backoff_seconds=settings.intelligence.kap_base_backoff_seconds,
+            max_backoff_seconds=settings.intelligence.kap_max_backoff_seconds)
         self.llm_provider=llm_provider or DisabledLLMProvider()
         self.event_repository=EventRepository(database)
         self.fundamental_provider=fundamental_provider or KapFundamentalProvider(database.path)

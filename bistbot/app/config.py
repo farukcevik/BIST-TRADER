@@ -180,6 +180,9 @@ class IntelligenceSettings(BaseModel):
     event_weight: float = Field(ge=0, le=1)
     event_score_weights: EventScoreWeights
     llm_materiality_threshold: float = Field(default=50,ge=0,le=100)
+    kap_retention_days: int = Field(default=90,ge=1)
+    kap_base_backoff_seconds: float = Field(default=30,gt=0)
+    kap_max_backoff_seconds: float = Field(default=900,gt=0)
 
     @model_validator(mode="after")
     def ranking_weights_sum_to_one(self) -> "IntelligenceSettings":
@@ -187,6 +190,8 @@ class IntelligenceSettings(BaseModel):
             raise ValueError("intelligence ranking weights must sum to 1.0")
         if self.kap_trust_score <= self.news_trust_score:
             raise ValueError("KAP trust must be higher than news trust")
+        if self.kap_max_backoff_seconds < self.kap_base_backoff_seconds:
+            raise ValueError("KAP maximum backoff must be greater than or equal to base backoff")
         return self
 
 
@@ -250,6 +255,9 @@ def _normalize_alternate_config(source: dict) -> dict:
             "recency_half_life_hours":intelligence.get("recency_half_life_hours",24),
             "scanner_weight":intelligence.get("scanner_weight",.4),"event_weight":intelligence.get("event_weight",.6),
             "llm_materiality_threshold":intelligence.get("llm_materiality_threshold",50),
+            "kap_retention_days":intelligence.get("kap_retention_days",90),
+            "kap_base_backoff_seconds":intelligence.get("kap_base_backoff_seconds",30),
+            "kap_max_backoff_seconds":intelligence.get("kap_max_backoff_seconds",900),
             "event_score_weights":intelligence.get("event_score_weights",{"recency":.25,"source_trust":.25,
                 "symbol_relevance":.2,"keywords":.15,"materiality":.15})},
         "risk":{"max_open_positions":portfolio.get("max_open_positions",5),

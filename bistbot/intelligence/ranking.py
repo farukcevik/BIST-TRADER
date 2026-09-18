@@ -51,7 +51,8 @@ class EventRanker:
         now = now or datetime.now(timezone.utc); symbols = [candidate.symbol for candidate in candidates]
         events, errors = [], []
         for name, provider in (("NEWS", self.news), ("KAP", self.kap)):
-            fetched, provider_errors = self._safe_fetch(name, provider, symbols)
+            fetched, provider_errors = self._safe_fetch(name, provider, symbols,
+                allow_symbol_fallback=name != "KAP")
             events.extend(fetched); errors.extend(provider_errors)
         events = [event.model_copy(update={"trust_score": self.settings.kap_trust_score
                   if event.source_type is EventSourceType.KAP else self.settings.news_trust_score}) for event in events]
@@ -80,7 +81,8 @@ class EventRanker:
             ranked.append(RankedEventCandidate(symbol=candidate.symbol, scanner_score=candidate.overall_scanner_score,
                 event_score=round(event_score,4), combined_score=round(combined,4),
                 event_ids=[event.id for event in sorted(symbol_events,key=lambda item:item.published_at,reverse=True)], reasons=reasons,
-                intelligence_status=IntelligenceStatus.EVENTS_AVAILABLE if material_events else IntelligenceStatus.NO_NEWS))
+                intelligence_status=(IntelligenceStatus.EVENTS_AVAILABLE if material_events else
+                    IntelligenceStatus.UNAVAILABLE if errors else IntelligenceStatus.NO_NEWS)))
         ranked.sort(key=lambda item:(-item.combined_score,item.symbol)); selected = ranked[:limit]
         if self.ranking_repository:
             cycle_id = uuid4().hex
@@ -88,9 +90,16 @@ class EventRanker:
             for source, reason in errors: self.ranking_repository.add_error(cycle_id, source, reason, now)
         return selected
 
-    def _safe_fetch(self, name: str, provider: NewsProvider | KapProvider, symbols: list[str]):
-        try: return provider.fetch(symbols), []
+    def _safe_fetch(self, name: str, provider: NewsProvider | KapProvider, symbols: list[str],
+                    *, allow_symbol_fallback: bool = True):
+        try:
+            fetched=provider.fetch(symbols)
+            if name=="KAP" and getattr(provider,"availability",None)=="UNAVAILABLE":
+                return fetched,[(name,"provider unavailable; cached disclosures retained")]
+            return fetched,[]
         except Exception as batch_error:
+            if not allow_symbol_fallback:
+                return [],[(name,f"{type(batch_error).__name__}: {batch_error}")]
             events, errors = [], []
             for symbol in symbols:
                 try: events.extend(provider.fetch([symbol]))

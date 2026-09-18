@@ -18,6 +18,16 @@ CREATE TABLE IF NOT EXISTS technical_levels(id INTEGER PRIMARY KEY, timestamp TE
 CREATE TABLE IF NOT EXISTS potential_assessments(id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, symbol TEXT NOT NULL, score REAL, confidence REAL NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS news_items(id INTEGER PRIMARY KEY, source_id TEXT, source TEXT, url TEXT, timestamp TEXT, title TEXT, body TEXT, symbol TEXT, relevance REAL, content_hash TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS kap_items(id INTEGER PRIMARY KEY, source_id TEXT, source TEXT, url TEXT, timestamp TEXT, title TEXT, body TEXT, symbol TEXT, relevance REAL, content_hash TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS kap_disclosure_poll_state(
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_success_at TEXT,cursor_published_at TEXT,
+    cooldown_until TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,last_http_status INTEGER,
+    last_error TEXT,updated_at TEXT NOT NULL,lease_owner TEXT,lease_expires_at TEXT);
+CREATE TABLE IF NOT EXISTS kap_disclosures_raw(
+    disclosure_id TEXT PRIMARY KEY,published_at TEXT NOT NULL,fetched_at TEXT NOT NULL,payload TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_kap_disclosures_raw_published ON kap_disclosures_raw(published_at);
+CREATE TABLE IF NOT EXISTS kap_processed_catalysts(
+    event_id TEXT PRIMARY KEY,published_at TEXT NOT NULL,processed_at TEXT NOT NULL,payload TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_kap_processed_catalysts_published ON kap_processed_catalysts(published_at);
 CREATE TABLE IF NOT EXISTS event_items(id TEXT PRIMARY KEY, symbol TEXT NOT NULL, source TEXT NOT NULL, source_type TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, url TEXT, published_at TEXT NOT NULL, fetched_at TEXT NOT NULL, hash TEXT UNIQUE NOT NULL, trust_score REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS intelligence_rankings(id INTEGER PRIMARY KEY, cycle_id TEXT NOT NULL, created_at TEXT NOT NULL, rank INTEGER NOT NULL, symbol TEXT NOT NULL, scanner_score REAL NOT NULL, event_score REAL NOT NULL, combined_score REAL NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS llm_analyses(id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, symbol TEXT NOT NULL, payload TEXT NOT NULL);

@@ -33,6 +33,9 @@ intelligence:
   news_trust_score: 65
   recency_half_life_hours: 24
   llm_materiality_threshold: 50
+  kap_retention_days: 90
+  kap_base_backoff_seconds: 30
+  kap_max_backoff_seconds: 900
   scanner_weight: 0.40
   event_weight: 0.60
   event_score_weights: {recency: 0.25, source_trust: 0.25, symbol_relevance: 0.20, keywords: 0.15, materiality: 0.15}

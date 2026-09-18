@@ -100,6 +100,9 @@ class EventRepository:
         cursor = self.database.execute("INSERT OR IGNORE INTO event_items VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (event.id,event.symbol,event.source,event.source_type.value,event.title,event.body,event.url,
              event.published_at.isoformat(),event.fetched_at.isoformat(),event.hash,event.trust_score))
+        if event.source_type.value=="KAP":
+            self.database.execute("INSERT OR IGNORE INTO kap_processed_catalysts(event_id,published_at,processed_at,payload) VALUES(?,?,?,?)",
+                (event.id,event.published_at.isoformat(),event.fetched_at.isoformat(),event.model_dump_json()))
         return cursor.rowcount == 1
 
     def get_by_ids(self,event_ids: list[str]) -> list[EventItem]:

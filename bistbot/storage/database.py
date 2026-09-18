@@ -37,6 +37,11 @@ class Database:
             self.connection.execute("ALTER TABLE kap_member_cache ADD COLUMN outstanding_shares REAL")
         if "company_type" not in kap_columns:
             self.connection.execute("ALTER TABLE kap_member_cache ADD COLUMN company_type TEXT")
+        poll_columns={row["name"] for row in self.connection.execute("PRAGMA table_info(kap_disclosure_poll_state)")}
+        if "lease_owner" not in poll_columns:
+            self.connection.execute("ALTER TABLE kap_disclosure_poll_state ADD COLUMN lease_owner TEXT")
+        if "lease_expires_at" not in poll_columns:
+            self.connection.execute("ALTER TABLE kap_disclosure_poll_state ADD COLUMN lease_expires_at TEXT")
         self.connection.commit()
 
     def execute(self, sql: str, parameters: Iterable[Any] = ()) -> sqlite3.Cursor:
