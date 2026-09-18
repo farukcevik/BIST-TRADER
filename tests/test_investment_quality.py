@@ -365,6 +365,40 @@ def test_flex_thresholds_are_hard_boundaries(overrides):
     assert decision.position_size_multiplier==0
 
 
+def test_gate_diagnostics_report_normal_and_flex_failures_without_changing_decision():
+    inputs=_flex_inputs(effective=45,confidence=36,technical_score=72,rr=1.4)
+    engine=_engine()
+    before=engine.evaluate_investment(*inputs,paper_mode=True)
+    diagnostics=engine.diagnose_investment_gates(inputs[0],inputs[1],inputs[3],paper_mode=True)
+    after=engine.evaluate_investment(*inputs,paper_mode=True)
+    assert before==after and after.buy_tier=="FLEX"
+    assert diagnostics["NORMAL"]["blocking_gates"]==[
+        "FUNDAMENTAL_QUALITY_LOW","FUNDAMENTAL_CONFIDENCE_LOW","INSUFFICIENT_RISK_REWARD"]
+    assert diagnostics["FLEX"]["passed"]
+    assert diagnostics["FLEX"]["blocking_gates"]==[]
+
+
+def test_gate_diagnostics_use_fallback_thresholds_and_exact_blockers():
+    technical,fundamental,catalyst,potential=_fallback_inputs(technical_score=74,rr=1.9,target_confidence=64)
+    diagnostics=_engine().diagnose_investment_gates(technical,fundamental,potential,
+        unavailable_policy=FundamentalUnavailablePolicy.TECHNICAL_ONLY_FALLBACK,paper_mode=True)
+    normal=diagnostics["NORMAL"]
+    assert normal["fundamental"]["passed"]
+    assert normal["confidence"]["blocking_gate"]=="FUNDAMENTAL_FALLBACK_CONFIDENCE_TOO_LOW"
+    assert normal["technical"]["blocking_gate"]=="FUNDAMENTAL_FALLBACK_TECHNICAL_SCORE_TOO_LOW"
+    assert normal["rr"]["blocking_gate"]=="FUNDAMENTAL_FALLBACK_RR_TOO_LOW"
+    assert diagnostics["FLEX"]["fundamental"]["blocking_gate"]=="FLEX_FUNDAMENTAL_DATA_REQUIRED"
+
+
+def test_gate_diagnostics_match_has_fundamental_data_reason_selection():
+    technical,fundamental,_,potential=_fallback_inputs()
+    partial=fundamental.model_copy(update={"available_metrics":["roe"],"coverage":0,
+        "fundamental_score":None,"effective_score":None})
+    diagnostics=_engine().diagnose_investment_gates(technical,partial,potential,
+        unavailable_policy=FundamentalUnavailablePolicy.BLOCK,paper_mode=True)
+    assert diagnostics["NORMAL"]["fundamental"]["blocking_gate"]=="FUNDAMENTAL_COVERAGE_LOW"
+
+
 def test_rr_below_flex_floor_always_holds_even_if_normal_rr_is_configured_lower():
     decision=_engine().evaluate_investment(*_flex_inputs(effective=80,confidence=80,technical_score=90,rr=1.29),
         minimum_risk_reward_ratio=1.0,paper_mode=True)

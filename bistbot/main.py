@@ -300,6 +300,23 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
         if rejected:
             reason=potential.get("unavailable_reason") or "MISSING_POTENTIAL_FIELDS: "+", ".join(missing)
             print(f"Potential Rejection Reason: {reason}")
+        print("NORMAL / FLEX GATES")
+        diagnostics_status=item.get("gate_diagnostics",{}).get("status")
+        if diagnostics_status=="UNAVAILABLE":
+            print(f"Gate diagnostics: UNAVAILABLE ({item['gate_diagnostics'].get('error','UNKNOWN_ERROR')})")
+        for tier in ("NORMAL","FLEX"):
+            tier_diagnostics=item.get("gate_diagnostics",{}).get(tier,{})
+            tier_result=("UNAVAILABLE" if tier_diagnostics.get("status")=="UNAVAILABLE" else
+                "PASS" if tier_diagnostics.get("passed") else "FAIL")
+            print(f"{tier}: {tier_result}")
+            for gate_name in ("fundamental","confidence","technical","rr"):
+                gate=tier_diagnostics.get(gate_name,{})
+                result=("UNAVAILABLE" if gate.get("passed") is None else
+                    "PASS" if gate.get("passed") else "FAIL")
+                print(f"  {gate_name}: {result} actual={gate.get('actual')} required={gate.get('threshold')}"
+                      f" blocker={gate.get('blocking_gate')}")
+            blockers=tier_diagnostics.get("blocking_gates",[])
+            print(f"  exact blocking gates: {', '.join(blockers) if blockers else 'NONE'}")
         print("FINAL DECISION")
         print(f"Decision: {item.get('decision','HOLD')}")
         print(f"Reason Code: {item.get('reason_code','LEGACY_STRATEGY_DECISION')}")
@@ -326,6 +343,10 @@ def print_verbose_diagnostics(diagnostics: dict) -> None:
               f"\nproposed_quantity: {item['proposed_quantity']}\nstop_price: {item['stop_price']}"
               f"\nmaximum_allowed_risk: {item['maximum_allowed_risk']}\nrisk_decision: {item['risk_decision']}"
               f"\nreason_code: {item['reason_code']}\nreason: {item['reason']}")
+    print("\nGATE REJECTION COUNTS")
+    counts=diagnostics.get("gate_rejection_counts",{})
+    if not counts: print("none")
+    for gate,count in sorted(counts.items()): print(f"{gate}: {count}")
     print()
 
 

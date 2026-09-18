@@ -73,6 +73,26 @@ def test_verbose_formatter_prints_valid_multi_target_potential(capsys):
     assert "Final entry_rr: 1.5" in output
 
 
+def test_verbose_formatter_prints_tier_gates_and_cycle_rejection_counts(capsys):
+    diagnostics={"candidates":[{"symbol":"AAA","decision":"HOLD","final_score":70,"reason":"fixture",
+        "news_status":"NO_NEWS","llm_status":"NOT_REQUIRED","signal_mode":"STAGED_INVESTMENT",
+        "gate_diagnostics":{"NORMAL":{"passed":False,"blocking_gates":["TECHNICAL_TIMING_WEAK"],
+            "fundamental":{"passed":True,"actual":70,"threshold":50,"blocking_gate":None},
+            "confidence":{"passed":True,"actual":80,"threshold":40,"blocking_gate":None},
+            "technical":{"passed":False,"actual":64,"threshold":65,"blocking_gate":"TECHNICAL_TIMING_WEAK"},
+            "rr":{"passed":True,"actual":2,"threshold":1.5,"blocking_gate":None}},
+            "FLEX":{"passed":False,"blocking_gates":["FLEX_TECHNICAL_SCORE_TOO_LOW"],
+            "fundamental":{"passed":True,"actual":70,"threshold":40,"blocking_gate":None},
+            "confidence":{"passed":True,"actual":80,"threshold":35,"blocking_gate":None},
+            "technical":{"passed":False,"actual":64,"threshold":70,"blocking_gate":"FLEX_TECHNICAL_SCORE_TOO_LOW"},
+            "rr":{"passed":True,"actual":2,"threshold":1.3,"blocking_gate":None}}}}],
+        "gate_rejection_counts":{"NORMAL.technical":1,"FLEX.technical":1}}
+    cli.print_verbose_diagnostics(diagnostics); output=capsys.readouterr().out
+    assert "NORMAL / FLEX GATES" in output
+    assert "exact blocking gates: TECHNICAL_TIMING_WEAK" in output
+    assert "FLEX.technical: 1" in output and "NORMAL.technical: 1" in output
+
+
 def test_verbose_formatter_explains_rejected_potential(capsys):
     diagnostics={"candidates":[{"symbol":"AAA","decision":"HOLD","final_score":70,"reason":"fixture",
         "news_status":"NO_NEWS","llm_status":"NOT_REQUIRED","signal_mode":"STAGED_INVESTMENT",

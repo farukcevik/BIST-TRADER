@@ -357,6 +357,7 @@ class BistBotApplication:
                         "catalyst_source":"deterministic news/KAP event score"})
             strategy_decision=(self._investment_decision(candidate.technical_signal,fundamental,catalyst,potential)
                                if potential else None)
+            gate_diagnostics=self._investment_gate_diagnostics(candidate.technical_signal,fundamental,potential)
             decisions.append(strategy_decision)
             detail={"symbol":candidate.symbol,"scanner_score":candidate.technical_signal.overall_scanner_score,
                 "latest_price":candidate.technical_signal.metrics.get("latest_price"),
@@ -384,6 +385,7 @@ class BistBotApplication:
                 "strategy_decision":strategy_decision.action.value if strategy_decision else Action.HOLD.value,
                 "reason_code":strategy_decision.reason_code if strategy_decision else "TECHNICAL_LEVELS_UNAVAILABLE",
                 "reason":strategy_decision.reason if strategy_decision else "TECHNICAL_LEVELS_UNAVAILABLE",
+                "gate_diagnostics":gate_diagnostics,
                 "signal_mode":"STAGED_INVESTMENT"}
             detail.update({"base_stock_score":strategy_decision.final_score if strategy_decision else 0,
                 "market_regime":regime.regime.value,"market_adjustment":overlay.market_adjustment,
@@ -438,6 +440,8 @@ class BistBotApplication:
                         fresh_potential)
                 except (TypeError,ValueError,KeyError):
                     strategy_decision=None; fresh_potential=None
+                detail["gate_diagnostics"]=self._investment_gate_diagnostics(
+                    candidate.technical_signal,fundamental,fresh_potential)
                 if strategy_decision is None or strategy_decision.action is Action.HOLD:
                     detail["decision"]=Action.HOLD.value
                     detail["reason_code"]=(strategy_decision.reason_code if strategy_decision
@@ -508,6 +512,7 @@ class BistBotApplication:
                 execution_time=execution_time,execution_provider=validation.provider))
         state=self.broker.get_portfolio_state(now=processing_time,persist=not dry_run)
         distributions=_score_distributions(self.scanner.last_signals)
+        gate_rejection_counts=_gate_rejection_counts(candidate_diagnostics)
         self.last_diagnostics={"positions":position_diagnostics,
                                "exit_orders":[{"symbol":order.symbol,"reason":order.reason,
                                    "quantity":order.quantity,"fill_price":str(order.fill_price)} for order in exit_orders],
@@ -515,6 +520,7 @@ class BistBotApplication:
                                    "open_positions":len(post_exit_state.positions),
                                    "valuation_status":"STALE_MARKET_DATA" if stale_position_symbols else "FRESH"},
                                "scanner":scanner_diagnostics,"candidates":candidate_diagnostics,
+                               "gate_rejection_counts":gate_rejection_counts,
                                "risk":risk_diagnostics,"thresholds":{"buy":self.settings.scoring.buy_threshold,
                                "sell":self.settings.scoring.sell_threshold},"score_distribution":distributions,
                                "providers":{"news":getattr(self.news,"availability",getattr(self.news,"provider_mode","DISABLED")),
@@ -624,11 +630,47 @@ class BistBotApplication:
             require_catalyst_confirmation=self.settings.strategy.require_catalyst_confirmation,
             paper_mode=self.settings.trading_mode=="PAPER")
 
+    def _investment_gate_diagnostics(self,technical,fundamental,potential):
+        policy=self.settings.investment_policy
+        fundamental_policy=self.settings.fundamental
+        try:
+            return self.strategy.diagnose_investment_gates(technical,fundamental,potential,
+                minimum_risk_reward_ratio=self.settings.strategy.minimum_risk_reward_ratio,
+                minimum_fundamental_score=fundamental_policy.minimum_score,
+                minimum_technical_score=policy.minimum_technical_score,
+                unavailable_policy=fundamental_policy.unavailable_policy,
+                fallback_minimum_risk_reward_ratio=fundamental_policy.fallback_minimum_risk_reward_ratio,
+                fallback_minimum_technical_score=fundamental_policy.fallback_minimum_technical_score,
+                fallback_minimum_potential_confidence=fundamental_policy.fallback_minimum_potential_confidence,
+                minimum_fundamental_confidence=fundamental_policy.minimum_confidence,
+                paper_mode=self.settings.trading_mode=="PAPER")
+        except Exception as error:
+            logger.warning("Investment gate diagnostics unavailable for %s: %s",
+                getattr(technical,"symbol","UNKNOWN"),type(error).__name__)
+            unavailable={"status":"UNAVAILABLE","passed":None,"blocking_gates":[],
+                **{name:{"passed":None,"actual":None,"threshold":None,"blocking_gate":None}
+                   for name in ("fundamental","confidence","technical","rr")}}
+            return {"status":"UNAVAILABLE","error":type(error).__name__,
+                "NORMAL":dict(unavailable),"FLEX":dict(unavailable)}
+
 
 def _build_fundamental_engine(settings: Settings) -> FundamentalEngine:
     fundamental=settings.fundamental
     return FundamentalEngine(FundamentalScoringSettings(weights=fundamental.weights,
         minimum_confidence=fundamental.minimum_confidence))
+
+
+def _gate_rejection_counts(candidates: list[dict]) -> dict[str,int]:
+    counts={}
+    for detail in candidates:
+        for tier in ("NORMAL","FLEX"):
+            tier_diagnostics=detail.get("gate_diagnostics",{}).get(tier,{})
+            for gate_name in ("fundamental","confidence","technical","rr"):
+                gate=tier_diagnostics.get(gate_name,{})
+                if gate.get("passed") is False:
+                    key=f"{tier}.{gate_name}"
+                    counts[key]=counts.get(key,0)+1
+    return counts
 
 
 def _score_distributions(signals) -> dict:

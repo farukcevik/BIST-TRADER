@@ -174,3 +174,78 @@ class DeterministicStrategyEngine:
             target_1=potential.target_1,target_2=potential.target_2,target_3=potential.target_3,
             rr_t1=potential.rr_t1,rr_t2=potential.rr_t2,rr_t3=potential.rr_t3,entry_rr=potential.entry_rr,
             buy_tier=buy_tier,position_size_multiplier=position_size_multiplier,labels=labels)
+
+    def diagnose_investment_gates(self, technical: TechnicalSignal, fundamental: FundamentalAssessment,
+            potential: PotentialAssessment | None, *, minimum_risk_reward_ratio: float=1.5,
+            minimum_fundamental_score: float=50, minimum_technical_score: float|None=None,
+            unavailable_policy: FundamentalUnavailablePolicy=FundamentalUnavailablePolicy.BLOCK,
+            fallback_minimum_risk_reward_ratio: float=2.0, fallback_minimum_technical_score: float=75,
+            fallback_minimum_potential_confidence: float=65,
+            minimum_fundamental_confidence: float=40, paper_mode: bool=False) -> dict:
+        """Describe NORMAL/FLEX eligibility gates without participating in the decision."""
+        technical_min=self.settings.buy_threshold if minimum_technical_score is None else minimum_technical_score
+        fallback=(fundamental.provider_status.value=="UNAVAILABLE" or
+            fundamental.fundamental_score is None or fundamental.effective_score is None)
+        has_fundamental_data=(fundamental.coverage>0 or bool(fundamental.available_metrics) or
+            fundamental.fundamental_score is not None or fundamental.effective_score is not None)
+        potential_available=potential is not None and potential.available
+        entry_rr=potential.entry_rr if potential is not None else None
+
+        def gate(actual,threshold,passed,blocker):
+            return {"passed":bool(passed),"actual":actual,"threshold":threshold,
+                "blocking_gate":None if passed else blocker}
+
+        if fallback:
+            fundamental_pass=(unavailable_policy is FundamentalUnavailablePolicy.TECHNICAL_ONLY_FALLBACK and
+                not fundamental.blocks_entry)
+            fundamental_blocker=("FUNDAMENTAL_BLOCKING_RED_FLAG" if fundamental.blocks_entry else
+                "FUNDAMENTAL_DATA_UNAVAILABLE" if not has_fundamental_data else
+                "FUNDAMENTAL_CONFIDENCE_LOW" if (fundamental.fundamental_score is not None and
+                    fundamental.effective_score is not None and
+                    fundamental.confidence<minimum_fundamental_confidence) else "FUNDAMENTAL_COVERAGE_LOW")
+            confidence_actual=potential.target_confidence if potential is not None else None
+            confidence_threshold=fallback_minimum_potential_confidence
+            confidence_blocker="FUNDAMENTAL_FALLBACK_CONFIDENCE_TOO_LOW"
+            technical_threshold=fallback_minimum_technical_score
+            rr_threshold=fallback_minimum_risk_reward_ratio
+            rr_blocker="FUNDAMENTAL_FALLBACK_RR_TOO_LOW"
+        else:
+            fundamental_pass=(not fundamental.blocks_entry and fundamental.effective_score is not None and
+                fundamental.effective_score>=minimum_fundamental_score)
+            fundamental_blocker=("FUNDAMENTAL_BLOCKING_RED_FLAG" if fundamental.blocks_entry else
+                "FUNDAMENTAL_QUALITY_LOW")
+            confidence_actual=fundamental.confidence
+            confidence_threshold=minimum_fundamental_confidence
+            confidence_blocker="FUNDAMENTAL_CONFIDENCE_LOW"
+            technical_threshold=technical_min
+            rr_threshold=minimum_risk_reward_ratio
+            rr_blocker="INSUFFICIENT_RISK_REWARD"
+        normal={
+            "fundamental":gate(fundamental.effective_score,
+                "TECHNICAL_ONLY_FALLBACK" if fallback else minimum_fundamental_score,
+                fundamental_pass,fundamental_blocker),
+            "confidence":gate(confidence_actual,confidence_threshold,
+                confidence_actual is not None and confidence_actual>=confidence_threshold,confidence_blocker),
+            "technical":gate(technical.technical_score,technical_threshold,
+                technical.technical_score>=technical_threshold,
+                "FUNDAMENTAL_FALLBACK_TECHNICAL_SCORE_TOO_LOW" if fallback else "TECHNICAL_TIMING_WEAK"),
+            "rr":gate(entry_rr,rr_threshold,potential_available and entry_rr is not None and entry_rr>=rr_threshold,
+                "POTENTIAL_ASSESSMENT_UNAVAILABLE" if not potential_available else rr_blocker)}
+        flex={
+            "fundamental":gate(fundamental.effective_score,40,
+                paper_mode and not fundamental.blocks_entry and not fallback and
+                fundamental.effective_score is not None and fundamental.effective_score>=40,
+                "FLEX_PAPER_MODE_REQUIRED" if not paper_mode else
+                "FUNDAMENTAL_BLOCKING_RED_FLAG" if fundamental.blocks_entry else
+                "FLEX_FUNDAMENTAL_DATA_REQUIRED" if fallback else "FLEX_FUNDAMENTAL_QUALITY_LOW"),
+            "confidence":gate(fundamental.confidence,35,fundamental.confidence>=35,
+                "FLEX_FUNDAMENTAL_CONFIDENCE_LOW"),
+            "technical":gate(technical.technical_score,70,technical.technical_score>=70,
+                "FLEX_TECHNICAL_SCORE_TOO_LOW"),
+            "rr":gate(entry_rr,1.30,potential_available and entry_rr is not None and entry_rr>=1.30,
+                "POTENTIAL_ASSESSMENT_UNAVAILABLE" if not potential_available else "RISK_REWARD_BELOW_FLEX_FLOOR")}
+        for tier in (normal,flex):
+            tier["passed"]=all(item["passed"] for item in tier.values())
+            tier["blocking_gates"]=[item["blocking_gate"] for name,item in tier.items()
+                if name not in {"passed","blocking_gates"} and not item["passed"]]
+        return {"NORMAL":normal,"FLEX":flex}
