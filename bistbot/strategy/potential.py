@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from enum import StrEnum
 from math import isfinite
 from pydantic import BaseModel, Field, model_validator
@@ -60,7 +61,8 @@ class PotentialAssessment(BaseModel):
 def assess_potential(entry_price: float | None, stop_price: float | None, levels: TechnicalLevels, atr_value: float,
         trend_strength: float, momentum: float, relative_volume: float, technical_score: float,
         fundamental_score: float | None, catalyst_score: float, market_regime: MarketRegime=MarketRegime.NORMAL,
-        sector_adjustment: float=0, catalyst_extension_limit_atr: float=.25) -> PotentialAssessment:
+        sector_adjustment: float=0, catalyst_extension_limit_atr: float=.25, *,
+        paper_slippage_pct: float=0, zone_atr_fraction: float=.35, tick_size: float=.01) -> PotentialAssessment:
     regime_factor={MarketRegime.RISK_ON:1,MarketRegime.NORMAL:.9,MarketRegime.CAUTION:.7,MarketRegime.RISK_OFF:.45,MarketRegime.CRISIS:.2}[market_regime]
     # Confidence describes the evidence supplied to this assessment, so it remains
     # meaningful even when price/structure validation makes the potential unavailable.
@@ -72,30 +74,46 @@ def assess_potential(entry_price: float | None, stop_price: float | None, levels
     if entry_price is None or not isinstance(entry_price,(int,float)) or not isfinite(entry_price) or entry_price<=0:
         return PotentialAssessment(symbol=levels.symbol,decision_timestamp=levels.timestamp,available=False,
             unavailable_reason="ENTRY_PRICE_UNAVAILABLE",target_confidence=confidence)
+    if (not isinstance(paper_slippage_pct,(int,float)) or not isfinite(paper_slippage_pct)
+            or paper_slippage_pct<0 or not isinstance(zone_atr_fraction,(int,float))
+            or not isfinite(zone_atr_fraction) or zone_atr_fraction<=0
+            or not isinstance(tick_size,(int,float)) or not isfinite(tick_size) or tick_size<=0):
+        return PotentialAssessment(symbol=levels.symbol,decision_timestamp=levels.timestamp,available=False,
+            unavailable_reason="INVALID_POTENTIAL_CALIBRATION",target_confidence=confidence)
+    # Mirror PaperBroker's BUY fill arithmetic and price-step rounding exactly.
+    execution_price=float((Decimal(str(entry_price))*(Decimal("1")+Decimal(str(paper_slippage_pct))))
+        .quantize(Decimal("0.0001"),rounding=ROUND_HALF_UP))
     if stop_price is None or not isfinite(stop_price) or not isfinite(atr_value) or atr_value<=0 or not 0<stop_price<entry_price:
         return PotentialAssessment(symbol=levels.symbol,decision_timestamp=levels.timestamp,available=False,
             unavailable_reason="INVALID_STOP_OR_ATR",target_confidence=confidence)
     supports=[value for value in [levels.support_1,levels.support_2,*levels.strong_support_zones,
-        *levels.swing_lows] if value is not None and isfinite(value) and 0<value<entry_price]
+        *levels.swing_lows] if value is not None and isfinite(value) and 0<value<execution_price]
     if not supports:
         return PotentialAssessment(symbol=levels.symbol,decision_timestamp=levels.timestamp,available=False,
             unavailable_reason="STRUCTURAL_SUPPORT_UNAVAILABLE",target_confidence=confidence)
     structural_support=max(supports)
     # The legacy supplied stop is validated for API compatibility but does not constrain
     # the dynamic result. A structure buffer avoids placing the stop exactly on support.
-    required_distance=max(entry_price*.03,atr_value*1.5,
-        entry_price-structural_support+atr_value*.25)
-    if required_distance/entry_price>0.08:
+    required_distance=max(execution_price*.03,atr_value*1.5,
+        execution_price-structural_support+atr_value*.25)
+    if required_distance/execution_price>0.08:
         return PotentialAssessment(symbol=levels.symbol,decision_timestamp=levels.timestamp,available=False,
             unavailable_reason="REQUIRED_STOP_EXCEEDS_8_PERCENT",target_confidence=confidence)
-    dynamic_stop=entry_price-required_distance
+    # Stop metadata is persisted at four decimals. Round toward the entry so the
+    # exposed/RiskEngine stop cannot represent more than the validated 8% risk.
+    dynamic_stop=float(Decimal(str(execution_price-required_distance))
+        .quantize(Decimal("0.0001"),rounding=ROUND_CEILING))
     named_candidates=[("resistance_1",levels.resistance_1),("resistance_2",levels.resistance_2),
         *(("strong_resistance",value) for value in levels.strong_resistance_zones),
         *(("swing_high",value) for value in levels.swing_highs)]
+    # Apply the level-analysis zone boundary so T1/T2 cannot be two prices from
+    # the same configured resistance zone.
+    zone_separation=max(tick_size,atr_value*zone_atr_fraction)
     validated=[]
     for name,value in sorted(named_candidates,key=lambda item:item[1] if item[1] is not None else float("inf")):
-        if value is None or not isfinite(value) or value<=entry_price: continue
-        if not any(abs(value-existing[1])<=max(.01,atr_value*.05) for existing in validated):
+        # A target inside the entry zone has no meaningful reward after PAPER slippage.
+        if value is None or not isfinite(value) or value-execution_price<=zone_separation: continue
+        if not any(abs(value-existing[1])<=zone_separation for existing in validated):
             validated.append((name,value))
     if len(validated)<2:
         return PotentialAssessment(symbol=levels.symbol,decision_timestamp=levels.timestamp,available=False,
@@ -104,24 +122,27 @@ def assess_potential(entry_price: float | None, stop_price: float | None, levels
     target_3=selected[2][1] if len(selected)>2 else None
     # Catalyst input (which may contain LLM context) deliberately cannot alter price targets.
     extension=0.0
-    downside=(entry_price-dynamic_stop)/entry_price*100
-    rr_t1=(target_1-entry_price)/(entry_price-dynamic_stop)
-    rr_t2=(target_2-entry_price)/(entry_price-dynamic_stop)
-    rr_t3=((target_3-entry_price)/(entry_price-dynamic_stop) if target_3 is not None else None)
+    downside=(execution_price-dynamic_stop)/execution_price*100
+    rr_t1=(target_1-execution_price)/(execution_price-dynamic_stop)
+    rr_t2=(target_2-execution_price)/(execution_price-dynamic_stop)
+    rr_t3=((target_3-execution_price)/(execution_price-dynamic_stop) if target_3 is not None else None)
     # Eligibility is deliberately based only on required T1/T2. T3 and the trailing
     # remainder can improve realized returns, but can never manufacture entry eligibility.
-    entry_rr=(rr_t1+rr_t2)/2
-    upside=(target_1-entry_price)/entry_price*100
+    raw_entry_rr=(rr_t1+rr_t2)/2
+    # The persisted/gated value must never round a just-below-threshold RR upward.
+    entry_rr=float(Decimal(str(raw_entry_rr)).quantize(Decimal("0.0001"),rounding=ROUND_FLOOR))
+    upside=(target_1-execution_price)/execution_price*100
     potential=max(0,min(100,upside*8+entry_rr*12+(confidence-50)*.2))
     return PotentialAssessment(symbol=levels.symbol,decision_timestamp=levels.timestamp,
         available=True,potential_score=round(potential,4),expected_target_price=round(target_1,4),
         expected_upside_pct=round(upside,4),target_confidence=confidence,
         target_method="validated_structure",
         target_components={f"{name}_{index}":round(value,4) for index,(name,value) in enumerate(selected,1)} |
-            {"bounded_catalyst_extension":round(extension,4),"t1_exit_pct":25.0,"t2_exit_pct":25.0,
+            {"paper_execution_price":round(execution_price,4),
+             "bounded_catalyst_extension":round(extension,4),"t1_exit_pct":25.0,"t2_exit_pct":25.0,
              "remaining_t3_or_trailing_pct":50.0},
         downside_reference=round(dynamic_stop,4),downside_risk_pct=round(downside,4),
         target_1=round(target_1,4),target_2=round(target_2,4),
         target_3=round(target_3,4) if target_3 is not None else None,
         rr_t1=round(rr_t1,4),rr_t2=round(rr_t2,4),rr_t3=round(rr_t3,4) if rr_t3 is not None else None,
-        entry_rr=round(entry_rr,4),risk_reward_ratio=round(entry_rr,4))
+        entry_rr=entry_rr,risk_reward_ratio=entry_rr)

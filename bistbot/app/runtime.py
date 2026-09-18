@@ -176,7 +176,9 @@ class BistBotApplication:
             potential=assess_potential(entry,stop,levels,float(signal.metrics["atr_14"]),signal.trend_score,
                 signal.momentum_score,float(signal.metrics.get("relative_volume",0)),signal.technical_score,
                 fundamental.fundamental_score,ranked.event_score if ranked.event_ids else 0,
-                regime.regime,overlay.sector_adjustment)
+                regime.regime,overlay.sector_adjustment,
+                zone_atr_fraction=self.settings.technical_levels.zone_atr_fraction,
+                tick_size=self.settings.technical_levels.tick_size)
             decision=self._investment_decision(signal,fundamental,catalyst,potential)
         except (KeyError,TypeError,ValueError):
             decision=None
@@ -343,7 +345,9 @@ class BistBotApplication:
                     float(candidate.technical_signal.metrics.get("relative_volume",0)),
                     candidate.technical_signal.technical_score,fundamental.fundamental_score,
                     ranking[candidate.symbol].event_score if ranking[candidate.symbol].event_ids else 0,
-                    regime.regime,overlay.sector_adjustment)
+                    regime.regime,overlay.sector_adjustment,
+                    zone_atr_fraction=self.settings.technical_levels.zone_atr_fraction,
+                    tick_size=self.settings.technical_levels.tick_size)
             except (KeyError,TypeError,ValueError) as error:
                 logger.warning("Levels/potential unavailable for %s: %s",candidate.symbol,type(error).__name__)
             if not dry_run:
@@ -435,7 +439,10 @@ class BistBotApplication:
                         float(candidate.technical_signal.metrics.get("relative_volume",0)),
                         candidate.technical_signal.technical_score,fundamental.fundamental_score,
                         ranking[candidate.symbol].event_score if ranking[candidate.symbol].event_ids else 0,
-                        regime.regime,overlay.sector_adjustment)
+                        regime.regime,overlay.sector_adjustment,
+                        paper_slippage_pct=self.settings.execution.slippage_pct,
+                        zone_atr_fraction=self.settings.technical_levels.zone_atr_fraction,
+                        tick_size=self.settings.technical_levels.tick_size)
                     strategy_decision=self._investment_decision(candidate.technical_signal,fundamental,catalyst,
                         fresh_potential)
                 except (TypeError,ValueError,KeyError):
